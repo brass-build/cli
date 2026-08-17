@@ -5,7 +5,7 @@ app's built bundle and pulls document schemas. It wraps the same data API the
 dashboard uses, authenticated by a token instead of a browser session, so
 the whole publish workflow runs unattended.
 
-This package tracks the platform's `0.1.x` line.
+This package tracks the platform's `0.2.x` line.
 
 ## Install
 
@@ -24,8 +24,8 @@ Two kinds of credential, for two audiences:
   under `~/.config/brass/`. It authorizes everything, including `schema pull`.
 - A **service token** (mint one in the dashboard: org Settings, then Service
   tokens) is the CI credential, supplied as `BRASS_SERVICE_TOKEN`. It
-  authorizes `publish` and `whoami`. It is an org-scoped machine identity
-  and, by design, cannot fetch schemas.
+  authorizes `publish` and `whoami`. It is an org-scoped machine identity,
+  so it cannot fetch schemas.
 
 ```sh
 npx @brass-build/cli login                  # developer: sign in with your browser
@@ -43,7 +43,7 @@ agent driving the sign-in), the flow splits in two: `brass login --start`
 prints the approval URL and code and exits immediately, and
 `brass login --check` checks that sign-in, storing the session once you have
 approved. Add `--wait` to poll until you approve, for two minutes by default
-or `--wait <seconds>` for a different bound; a code that lapses inside the
+or `--wait <seconds>` for a different bound. A code that lapses inside the
 wait is replaced and the new one printed, so a sign-in started long before it
 is needed still completes. Reaching the bound with the code still good is
 reported as `pending` and exits 0, so the next check picks the same sign-in
@@ -74,10 +74,10 @@ resolved for this directory, and whether that app is deployed, then prints a
 `Next:` line naming the exact next step (sign in, publish to create the app,
 deploy, or open the live URL). When a `brass login --start` sign-in is waiting
 for approval, it reports the code, the approval URL, and how long the code has
-left. Run it before a publish to see what will
-happen, and after one to confirm the app is live. `whoami` is the narrower
-check when you only need to know the credential works. Add `--json` for the
-machine-readable result on stdout.
+left. Run it before a publish to see what will happen, and after one to
+confirm the app is live. `whoami` is the narrower check when you only need to
+know the credential works. Add `--json` for the machine-readable result on
+stdout.
 
 ## Publish
 
@@ -100,15 +100,18 @@ publishes then resolve the same app instead of creating a duplicate each run.
 A service token creates the app in its own organization, so no `--org` is
 needed.
 
-The command enables hosting if needed, uploads the bundle, waits for it to go
-live, and reports the URL. The platform reads your app's capabilities
+The command enables hosting if needed, uploads the bundle, waits for the
+platform to register the slot, and reports the URL. The URL can answer 404
+until the slot reaches the serving edges, so reload if the first request
+misses. The platform reads your app's capabilities
 (`opens` / `creates` / `schema`) from the `/.well-known/brass-app.json` you
 serve, so keep that manifest in the bundle.
 
 Flags: `--app`, `--name`, `--org` (organization to own a newly created app;
 defaults to a service token's own org), `--client-token` (stable idempotency
 key for a first create), `--slug` (preferred subdomain), `--manifest`
-(default `brass-app.json`).
+(default `brass-app.json`), `--visibility` (`private`, `invitee_visible` or
+`public`), `--gate` (`on` or `off`, the hosted load gate).
 
 ## Pull a schema
 
@@ -122,8 +125,8 @@ npx @brass-build/cli schema pull --doc <docId> --out brass-app.json
 This writes the document's schema body verbatim into the manifest's `schema`
 field, preserving everything else. That is the same copy-verbatim step the
 SDK's schema guide describes, done for you. It is a development-time action
-that needs a signed-in session (`brass login`); a service token cannot fetch
-schemas.
+that needs a signed-in session (`brass login`), since a service token cannot
+fetch schemas.
 
 ## Pull your organization's agent instructions
 
@@ -134,13 +137,13 @@ AGENTS.md / CLAUDE.md), pull the current body into your repo:
 npx @brass-build/cli agents pull --out AGENTS.md
 ```
 
-The instructions are stored once at the organization level (admins edit them
-on the dashboard Settings tab) so every developer's coding agent works from
-one source of truth. The pull writes the body verbatim, so it round-trips
-byte-for-byte with what the dashboard stored. `--org <organizationId>` is
-optional when you belong to a single organization; pass it when you belong to
-more than one. This needs a signed-in session (`brass login`); a service token
-is not an organization member, so it cannot read the instructions.
+Brass stores the instructions once at the organization level (admins edit
+them on the dashboard Settings tab) so every developer's coding agent works
+from one source of truth. The pull writes the body verbatim, so it
+round-trips byte-for-byte with what the dashboard stored. Pass
+`--org <organizationId>` when you belong to more than one organization. This
+needs a signed-in session (`brass login`), since a service token is not an
+organization member and cannot read the instructions.
 
 Pass `--stdout` instead of `--out` to print the instructions to stdout
 without writing a file (status goes to stderr, so stdout carries only the

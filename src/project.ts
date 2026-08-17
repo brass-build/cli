@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, stat, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir, stat, mkdir, realpath } from 'node:fs/promises';
 import { join, relative, sep, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { zipSync } from 'fflate';
@@ -123,22 +123,56 @@ export function mergeSchemaIntoManifest(
 // by forward-slash relative path (zip entries never use the OS separator).
 // Symlinks are followed via `stat`; empty directories are omitted (a static
 // bundle has none that matter).
+// The one entry name a zip built from an object map cannot carry. Assigning it
+// on an ordinary object literal runs the prototype setter instead of adding an
+// entry, and both this walk and fflate's own index are such maps, so the file
+// drops out of the archive and the map inherits from the bytes it was handed.
+// fflate then walks that index with `for...in`, reaches the inherited keys, and
+// writes one bogus directory per byte of the file. Only the exact name at the
+// root of the bundle does this: a `__proto__` inside a subdirectory is keyed by
+// its whole relative path, which is an ordinary string.
+const UNPUBLISHABLE_ENTRY_NAME = '__proto__';
+
 export async function collectZipEntries(root: string): Promise<Record<string, Uint8Array>> {
-  const entries: Record<string, Uint8Array> = {};
-  async function walk(dir: string): Promise<void> {
+  // Null-prototype, so the name above lands as an ordinary key and the refusal
+  // below can see it. On a plain literal it is already gone by then.
+  const entries: Record<string, Uint8Array> = Object.create(null) as Record<
+    string,
+    Uint8Array
+  >;
+  // The real paths of the directories on the way down to `dir`, so a symlink
+  // pointing back at one of its own ancestors ends the descent instead of
+  // walking the subtree again at every level. `stat` resolves symlinks, so
+  // without this the walk re-reads the whole subtree until the kernel refuses
+  // the path at its symlink depth and the publish dies on a raw ELOOP naming a
+  // path thousands of characters long. Only an ANCESTOR ends it: two separate
+  // links to one directory are two real places to publish from, and each is
+  // still walked.
+  async function walk(dir: string, ancestors: readonly string[]): Promise<void> {
+    const real = await realpath(dir);
+    if (ancestors.includes(real)) return;
+    const chain = [...ancestors, real];
     const names = await readdir(dir);
     for (const name of names) {
       const abs = join(dir, name);
       const info = await stat(abs);
       if (info.isDirectory()) {
-        await walk(abs);
+        await walk(abs, chain);
       } else if (info.isFile()) {
         const rel = relative(root, abs).split(sep).join('/');
         entries[rel] = new Uint8Array(await readFile(abs));
       }
     }
   }
-  await walk(root);
+  await walk(root, []);
+  if (UNPUBLISHABLE_ENTRY_NAME in entries) {
+    throw new Error(
+      `Cannot publish a file named "${UNPUBLISHABLE_ENTRY_NAME}" at the top ` +
+        `level of ${root}: the archive format keys entries by name, and that ` +
+        `name is an object's prototype rather than an entry. Rename or remove ` +
+        `it.`,
+    );
+  }
   return entries;
 }
 

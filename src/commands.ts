@@ -109,7 +109,7 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   if (opts.visibility !== undefined) {
     await ensureVisibility(ctx, appId, opts.visibility, resolved.detail?.visibility);
   }
-  const hosting = await ensureHosting(ctx, appId, opts.slug);
+  const hosting = await ensureHosting(ctx, appId, opts.slug, opts.requireAccess);
   if (opts.requireAccess !== undefined) {
     await ensureGate(ctx, appId, opts.requireAccess, hosting);
   }
@@ -126,7 +126,12 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   // of a couple of reads instead of an upload and a poll loop.
   const unchanged = await activeVersionMatches(ctx, appId, hash);
   if (unchanged !== null) {
-    const status = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
+    const status = await awaitGateSettled(
+      ctx,
+      appId,
+      await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`),
+      opts.sleep ?? realSleep,
+    );
     ctx.log.success(`Already up to date${status.url ? `: ${status.url}` : ''}`);
     // Refreshed here too, so publishing twice says the same thing both times.
     // A publisher acting on a warning re-runs publish to check, and a signal
@@ -164,7 +169,12 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   // schema missing `family`) right here instead of silently later.
   const warnings = await refreshCapabilities(ctx, appId);
 
-  const status = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
+  const status = await awaitGateSettled(
+    ctx,
+    appId,
+    await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`),
+    opts.sleep ?? realSleep,
+  );
   if (status.url) ctx.log.success(`Deployed: ${status.url}`);
   return { app_id: appId, version_id: version.version_id, url: status.url, warnings };
 }
@@ -223,14 +233,13 @@ async function ensureVisibility(
 }
 
 // Converge the hosted load gate to `want` (`true` = gated to the audience,
-// `false` = world-loadable). Always PATCH, even when the DDB flag already
-// reads `want`: the PATCH is what reaches the server-side reconcile that
-// repairs a wedged edge marker (a prior toggle whose flag write landed but
-// whose marker write lost every ETag race leaves the flag reading correct
-// while the marker disagrees). Skipping the PATCH on a matching flag would
-// leave such a gate wedged forever, since every later publish would skip it
-// too. `status` is the state `ensureHosting` just observed, used only to word
-// the log line. (`require_access` absent === off.)
+// `false` = world-loadable). Always PATCH, even when the reported state
+// already reads `want`: the PATCH is what asks the platform to re-settle a
+// gate whose reported and served states have drifted apart, which reading the
+// reported one alone cannot detect. Skipping it on a match would leave such an
+// app stuck, since every later publish would skip it too. `status` is the
+// state `ensureHosting` just observed, used only to word the log line.
+// (`require_access` absent === off.)
 async function ensureGate(
   ctx: CommandContext,
   appId: string,
@@ -250,15 +259,22 @@ async function ensureGate(
   }
 }
 
+// Enable hosting when the app is not hosted yet, at the load-gate state the
+// publish wants. Stating the gate here rather than leaving it to the PATCH
+// below settles it in one step: a new slot is gated by default, so a publish
+// that wants a world-loadable one would otherwise turn the gate on and
+// straight back off, doing twice the work to reach one state.
 async function ensureHosting(
   ctx: CommandContext,
   appId: string,
   slug?: string,
+  requireAccess?: boolean,
 ): Promise<HostingStatus> {
   const status = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
   if (status.enabled) return status;
-  const body: { slug?: string } = {};
+  const body: { slug?: string; require_access?: boolean } = {};
   if (slug !== undefined) body.slug = slug;
+  if (requireAccess !== undefined) body.require_access = requireAccess;
   const enabled = await ctx.api.post<HostingStatus>(
     `/apps/${encodeURIComponent(appId)}/hosting`,
     body,
@@ -267,11 +283,42 @@ async function ensureHosting(
   return enabled;
 }
 
-// The currently-served version when it is `ready` and already carries
-// `hash`, else null. A null (no active version, a non-ready active version, or
-// a hash mismatch) means `publish` must upload. A first deploy has no active
-// version, so it always uploads; a version predating content hashing has no
-// recorded hash and so never matches, forcing one re-upload that self-heals.
+// A published bundle is not reachable until the platform has registered the
+// slot to serve it, and that registration can lag or fail on its own. Reading
+// the status is what asks the platform to settle it, so a slot that is not
+// ready yet is re-read a few times before publish gives up. Publishing
+// reports success only once the slot will actually serve, so an unreachable
+// one is a failed publish rather than a URL that answers 404.
+const GATE_SETTLE_ATTEMPTS = 3;
+const GATE_SETTLE_GAP_MS = 2000;
+
+async function awaitGateSettled(
+  ctx: CommandContext,
+  appId: string,
+  status: HostingStatus,
+  sleep: (ms: number) => Promise<void>,
+): Promise<HostingStatus> {
+  // An api that does not report the field tells us nothing to act on.
+  if (status.gate_settled !== false) return status;
+  for (let attempt = 1; attempt < GATE_SETTLE_ATTEMPTS; attempt++) {
+    await sleep(GATE_SETTLE_GAP_MS);
+    const latest = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
+    if (latest.gate_settled !== false) return latest;
+  }
+  // Says what is true of the SLOT, because both publish paths end here: the
+  // one that uploaded a new bundle and the one that found the app already
+  // serving this exact bundle and skipped the upload. A message naming an
+  // upload sends the second caller looking for one that never happened.
+  throw new Error(
+    'The hosted slot never registered, so it will not serve. ' +
+      'Run publish again to retry.',
+  );
+}
+
+// The currently-served version when it is `ready` and already carries `hash`,
+// else null. A null (no active version, a non-ready active version, or a hash
+// mismatch) means `publish` must upload. A first deploy has no active version,
+// so it always uploads.
 async function activeVersionMatches(
   ctx: CommandContext,
   appId: string,
@@ -287,8 +334,8 @@ async function activeVersionMatches(
 
 // Poll until the version reaches a KNOWN terminal state (`ready` / `failed`),
 // then return it; time out otherwise. Deliberately loops while the status is
-// anything other than a known terminal — `pending` OR any status this pinned
-// CLI does not recognize — rather than returning on `!== 'pending'`. That way
+// anything other than a known terminal (`pending`, or any status this pinned
+// CLI does not recognize) rather than returning on `!== 'pending'`. That way
 // a future server status (a finer-grained non-terminal like `unpacking`, or a
 // new terminal-failure like `rejected`) is not mistaken for "done": an
 // unrecognized non-terminal keeps polling, and an unrecognized terminal

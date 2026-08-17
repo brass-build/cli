@@ -6,6 +6,27 @@ package follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, minor releases may introduce breaking
 changes.
 
+## 0.2.0
+
+### Added
+
+- `brass publish` waits for the platform to register the hosted slot before
+  reporting success, and fails when it never registers. The slot reaches the
+  serving edges shortly after that, so a URL the command reports can answer
+  404 for a few seconds before it serves.
+
+### Changed
+
+- `brass logout` ends the sign-in on the server as well as on this machine, so
+  a copy of the credentials file left elsewhere stops working. It also cancels
+  a started sign-in this machine has not redeemed yet, so a code relayed to a
+  human cannot be approved and spent afterwards. When Brass cannot be reached,
+  the local credential is still cleared and the command says which half did not
+  happen; `--json` carries this as `revoked`.
+- `brass publish --gate` states the load gate when it enables hosting, so a
+  publish that wants a world-loadable app no longer turns the gate on and
+  straight back off.
+
 ## 0.1.0
 
 Initial public release. The `brass` command-line tool publishes apps and

@@ -10,10 +10,8 @@ this file is the short path for you.
 Before you start building, fetch the organization's own agentic-coding
 instructions and follow them: the conventions it wants every app built on
 Brass to follow (its `AGENTS.md` / `CLAUDE.md`). Run the pull rather than
-deciding up front whether the org has any; nothing loads them for you, and an
-empty result (the org set none) is something you learn by running it, not by
-assuming it. Treat what it returns as an instruction file committed to the
-repo.
+deciding up front whether the org has any, because nothing loads them for
+you. Treat what it returns as an instruction file committed to the repo.
 
 ```sh
 npx @brass-build/cli agents pull --out AGENTS.md
@@ -30,18 +28,17 @@ Keep it current one of two ways:
 - **Cache:** commit the pulled file and refresh it periodically. Add a
   `CLAUDE.md` whose entire contents are the single line `@AGENTS.md` so
   Claude Code picks it up too (Claude Code auto-loads `CLAUDE.md`, not
-  `AGENTS.md`); the command prints this reminder after a pull.
+  `AGENTS.md`). The command prints this reminder after a pull.
 
-The pull needs a signed-in session (`brass login`); a service token is not an
-organization member and cannot read the instructions. If you are not signed
-in, run the sign-in yourself rather than skipping: `brass login --start`,
-relay the printed URL and code to the human, then `brass login --check --wait`
-until it reports approved (it is the same credential you will use to publish).
-[Signing in](#signing-in) covers the whole flow, including what to do while
-you wait for the approval.
-`--org <organizationId>` is only needed when the human belongs to more than
-one organization. An empty result means the organization has set no
-instructions, and there is nothing to follow.
+The pull needs a signed-in session (`brass login`), since a service token is
+not an organization member and cannot read the instructions. If you are not
+signed in, run the sign-in yourself rather than skipping: `brass login
+--start`, relay the printed URL and code to the human, then `brass login
+--check --wait` until it reports approved (it is the same credential you will
+use to publish). [Signing in](#signing-in) covers the whole flow, including
+what to do while you wait for the approval. Pass `--org <organizationId>`
+when the human belongs to more than one organization. An empty result means
+the organization has set no instructions.
 
 ## Signing in
 
@@ -62,10 +59,10 @@ good at publish time.
 
 The session gates your organization's coding conventions, and those shape the
 code you are about to write, so wait for it before you build rather than
-building twice. If you do have work that does not depend on them, the wait
-costs nothing to repeat: a bound reached with the code still approvable
-reports `pending`, and the next `--check --wait` picks the same sign-in back
-up where it left off.
+building twice. Do work that does not depend on them in the meantime and
+repeat the wait: a bound reached with the code still approvable reports
+`pending`, and the next `--check --wait` picks the same sign-in back up where
+it left off.
 
 Read the `state` in its `--json` result:
 
@@ -73,6 +70,11 @@ Read the `state` in its `--json` result:
 - `pending`: the code you relayed is still good. Run the check again.
 - `renewed`: the code changed. Relay the new one from the same output.
 - `denied`: the human refused. Ask them why before starting another.
+- `none`: nothing is in flight. Run `brass login --start` first.
+
+`brass login --start` reports `started` with the code to relay, and
+`--start --wait` reports the state it reached instead, so either form leaves
+one `--json` document to read.
 
 Run `brass login --start` again only when there is nothing in flight; it
 resumes the sign-in already waiting rather than issuing a second code, so a
@@ -107,7 +109,7 @@ again. The steps below are what it walks you through:
    npx @brass-build/cli publish ./dist
    ```
 
-   The first run creates the app and writes `.brass/project.json`; commit
+   The first run creates the app and writes `.brass/project.json`. Commit
    that so re-runs target the same app. A service token creates the app in
    its own organization, so no `--org` is needed. If the pipeline does not
    persist `.brass/project.json` between runs, set a stable `client_token`
@@ -115,8 +117,8 @@ again. The steps below are what it walks you through:
    first create is idempotent and re-runs resolve the same app.
 
 Run with `--json` to get the result (`app_id`, `url`) as JSON on stdout for
-your own parsing. A non-zero exit means the publish failed; the reason is on
-stderr.
+your own parsing. A non-zero exit means the publish failed, and the reason is
+on stderr.
 
 ## Pulling a schema to build against
 
@@ -128,11 +130,12 @@ npx @brass-build/cli schema pull --doc <docId> --out brass-app.json
 ```
 
 This writes the schema verbatim into your manifest. Build your types against
-that copy; do not re-approximate it from memory (a mismatched `required`
-shape makes the platform read your app as a different shape). This is a
-development-time step that needs a signed-in session (`brass login`), not a
-service token; if you only have `BRASS_SERVICE_TOKEN`, ask the human to run
-`brass login` or to copy the schema from the document's dashboard page.
+that copy rather than re-approximating it from memory, since a mismatched
+`required` shape makes the platform read your app as a different shape. This
+is a development-time step that needs a signed-in session (`brass login`),
+not a service token. When you only have `BRASS_SERVICE_TOKEN`, ask the human
+to run `brass login` or to copy the schema from the document's dashboard
+page.
 
 ## Verifying
 
@@ -149,10 +152,10 @@ are on. The CLI reports the state it observed, and the states have different
 fixes:
 
 - **A 401 or 403** means the credential is expired, missing, or not allowed.
-  A session expires, so `brass login` is the fix; a service token that is
-  rejected needs a valid `BRASS_SERVICE_TOKEN`. A fresh checkout or a fresh
-  container has no session at all, which is the ordinary starting state, not
-  a broken one.
+  Run `brass login` to replace an expired session, or set a valid
+  `BRASS_SERVICE_TOKEN` for a rejected service token. A fresh checkout or a
+  fresh container has no session at all, which is the ordinary starting
+  state, not a broken one.
 - **"Network error reaching <url>"** is the only error meaning the request
   never completed. It names the host it tried.
 - **Any other status** is a fault on the server side. The credential is

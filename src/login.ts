@@ -37,6 +37,10 @@ export interface LoginStartOptions {
   // Mint a fresh grant even when a usable one is pending (`--new`), for a
   // human who lost the relayed code.
   force?: boolean;
+  // Set when a wait follows in the same command (`--start --wait`), whose own
+  // terminal result is the one the caller reads. `--json` is one document per
+  // run, so the started state prints to the human stream only.
+  resultFollows?: boolean;
   env?: NodeJS.ProcessEnv;
   now?: () => number;
 }
@@ -59,14 +63,16 @@ export async function loginStart(options: LoginStartOptions): Promise<number> {
   promptFor(options.log, pending, {
     lead: resumed === null ? null : 'A sign-in is already waiting for approval.',
   });
-  options.log.result({
-    state: 'started',
-    resumed: resumed !== null,
-    verification_url: targetUrl(pending),
-    user_code: pending.userCode,
-    expires_at: pending.expiresAt,
-    expires_in_seconds: remainingSeconds(pending, now()),
-  });
+  if (options.resultFollows !== true) {
+    options.log.result({
+      state: 'started',
+      resumed: resumed !== null,
+      verification_url: targetUrl(pending),
+      user_code: pending.userCode,
+      expires_at: pending.expiresAt,
+      expires_in_seconds: remainingSeconds(pending, now()),
+    });
+  }
   return 0;
 }
 

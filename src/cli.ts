@@ -6,7 +6,10 @@ import {
   parseArgs,
   stringFlag,
   boolFlag,
+  extraPositionals,
+  flagsNotReadBy,
   unknownFlags,
+  valueFlagsOf,
   valuelessFlags,
   type ParsedArgs,
 } from './args.js';
@@ -18,10 +21,15 @@ import {
   type Origins,
   type Profile,
 } from './config.js';
-import { readCredentialsFile, readPendingLogin, writeStoredCredential } from './store.js';
+import {
+  readCredentialsFile,
+  readPendingLogin,
+  writePendingLogin,
+  writeStoredCredential,
+} from './store.js';
 import { BrassApi, BrassApiError, type AppVisibility } from './api.js';
 import { serviceTokenAuth, type AuthProvider } from './auth.js';
-import { loginDevice, sessionAuth } from './session.js';
+import { loginDevice, postDeviceCancel, postSignOut, sessionAuth } from './session.js';
 import { loginStart, loginCheck } from './login.js';
 import { createLogger, type Logger } from './log.js';
 import {
@@ -31,6 +39,7 @@ import {
   whoami,
   status,
   type CommandContext,
+  type CredentialKind,
 } from './commands.js';
 import { readProjectState, resolveAppId, readManifest } from './project.js';
 
@@ -47,7 +56,7 @@ Usage:
   brass login --check        Check a started sign-in once; stores the session when approved.
                              --wait [seconds] polls until approved (default 120s), renewing
                              an expired code in place and printing the new one.
-  brass logout               Forget the stored sign-in for this environment.
+  brass logout               End the stored sign-in for this environment, here and on the server.
   brass status [dir]         Report the credential + app state and the one command to run next.
   brass publish [dir]        Build output in [dir] (default: dist) is deployed to the app's hosting.
   brass schema pull --doc <docId> [--out brass-app.json]
@@ -82,8 +91,15 @@ Publish flags:
 export async function run(argv: readonly string[]): Promise<number> {
   const parsed = parseArgs(argv);
   const command = parsed.positionals[0];
+  // Which credential the invocation resolved, once it has. A 401 is reported
+  // in that credential's own vocabulary, so it stays undefined until
+  // `buildContext` settles it and a failure before then carries no guess.
+  let credentialKind: CredentialKind | undefined;
 
-  if (boolFlag(parsed, 'version') && command === undefined) {
+  // Answered whichever command follows, like `--help` beside it: both are
+  // declared flags of every command (`COMMON_FLAGS`), so a caller who asks
+  // which version is installed gets the answer rather than a publish.
+  if (boolFlag(parsed, 'version')) {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
@@ -103,6 +119,41 @@ export async function run(argv: readonly string[]): Promise<number> {
     return 1;
   }
 
+  // Then what THIS command reads, which is the same check one scope in: a
+  // flag or a positional the command ignores leaves the run differing from
+  // what the command line asked for, with nothing said. Judged from argv
+  // alone, so it answers a caller who has not signed in.
+  const misplaced = flagsNotReadBy(parsed, command);
+  if (misplaced.length > 0) {
+    const names = misplaced.map((n) => `--${n}`).join(', ');
+    process.stderr.write(
+      `error: ${names} ${misplaced.length === 1 ? 'is not a flag' : 'are not flags'} of \`brass ${command}\`\n\n${USAGE}`,
+    );
+    return 1;
+  }
+  const extra = extraPositionals(parsed, command);
+  if (extra.length > 0) {
+    const args = extra.map((p) => JSON.stringify(p)).join(', ');
+    process.stderr.write(
+      `error: unexpected ${extra.length === 1 ? 'argument' : 'arguments'} ${args} for \`brass ${command}\`\n\n${USAGE}`,
+    );
+    return 1;
+  }
+  if (parsed.valuedBooleans.length > 0) {
+    const names = parsed.valuedBooleans.map((n) => `--${n}`).join(', ');
+    process.stderr.write(
+      `error: ${names} ${parsed.valuedBooleans.length === 1 ? 'takes' : 'take'} no value\n`,
+    );
+    return 1;
+  }
+  const bare = valuelessFlags(parsed, valueFlagsOf(command));
+  if (bare.length > 0) {
+    process.stderr.write(
+      `error: Missing value for ${bare.map((n) => `--${n}`).join(', ')}\n`,
+    );
+    return 1;
+  }
+
   const json = boolFlag(parsed, 'json');
   const log = createLogger(json);
 
@@ -115,31 +166,62 @@ export async function run(argv: readonly string[]): Promise<number> {
     // (and the next step to obtain one) is a first-class outcome, not an error.
     if (command === 'status') return await runStatus(parsed, log);
 
-    const ctx = await buildContext(parsed);
-    switch (command) {
-      case 'publish':
-        log.result(await runPublish(ctx, parsed));
-        return 0;
-      case 'schema':
-        log.result(await runSchema(ctx, parsed));
-        return 0;
-      case 'agents':
-        log.result(await runAgents(ctx, parsed));
-        return 0;
-      case 'whoami':
-        log.result(await whoami(ctx));
-        return 0;
-      default:
-        process.stderr.write(`Unknown command "${command}".\n\n${USAGE}`);
-        return 1;
+    // What the caller asked for is decided from argv alone, so it is decided
+    // BEFORE a credential is resolved. A misspelt command, a missing
+    // subcommand and an invalid flag value are all answerable without one, and
+    // resolving the credential first answers every one of them with "No
+    // credential. Run `brass login`": the caller re-authenticates over a typo,
+    // and only a caller who already has a credential is ever shown the message
+    // naming the real mistake.
+    if (!isCredentialedCommand(command)) {
+      process.stderr.write(`Unknown command "${command}".\n\n${USAGE}`);
+      return 1;
     }
+    const plan = planCommand(command, parsed);
+
+    const ctx = await buildContext(parsed);
+    credentialKind = ctx.credentialKind;
+    log.result(await plan(ctx));
+    return 0;
   } catch (err) {
-    process.stderr.write(`${formatError(err)}\n`);
+    process.stderr.write(`${formatError(err, credentialKind)}\n`);
     return 1;
   }
 }
 
 type Context = CommandContext;
+
+// The commands that need a resolved credential; `login` / `logout` / `status`
+// are answered above without one.
+const CREDENTIALED_COMMANDS = ['publish', 'schema', 'agents', 'whoami'] as const;
+type CredentialedCommand = (typeof CREDENTIALED_COMMANDS)[number];
+
+function isCredentialedCommand(value: string): value is CredentialedCommand {
+  return (CREDENTIALED_COMMANDS as readonly string[]).includes(value);
+}
+
+// The work a command will do once it has a credential.
+type CommandPlan = (ctx: Context) => Promise<unknown>;
+
+// Resolve argv to that work, validating everything argv alone decides and
+// throwing on a shape the caller got wrong. Splitting the plan from the run is
+// what lets the shape be judged before a credential is resolved.
+function planCommand(command: CredentialedCommand, parsed: ParsedArgs): CommandPlan {
+  switch (command) {
+    case 'publish':
+      return planPublish(parsed);
+    case 'schema':
+      return planSchema(parsed);
+    case 'agents':
+      return planAgents(parsed);
+    case 'whoami':
+      return (ctx): Promise<unknown> => whoami(ctx);
+    default: {
+      const exhaustive: never = command;
+      throw new Error(`Unhandled command "${String(exhaustive)}"`);
+    }
+  }
+}
 
 interface Base {
   origins: Origins;
@@ -226,6 +308,7 @@ async function runLogin(parsed: ParsedArgs, log: Logger): Promise<number> {
       profile,
       log,
       ...(boolFlag(parsed, 'new') ? { force: true } : {}),
+      ...(waitSeconds !== undefined ? { resultFollows: true } : {}),
     });
     // `--start --wait` is the whole sign-in in one command: relay the code it
     // prints, then it holds for the approval up to the deadline.
@@ -245,10 +328,38 @@ async function runLogin(parsed: ParsedArgs, log: Logger): Promise<number> {
 }
 
 async function runLogout(parsed: ParsedArgs, log: Logger): Promise<number> {
-  const { profile } = resolveBase(parsed);
+  const { origins, profile } = resolveBase(parsed);
+
+  // Revoke on the server first, while the pointer is still readable. A
+  // service token belongs to an organization and is revoked in the dashboard,
+  // so only a stored session has anything to end here.
+  const file = await readCredentialsFile();
+  const stored = file?.credentials[profile]?.session?.sid;
+  const signedOut = stored === undefined ? true : await postSignOut(origins.authBaseUrl, stored);
+
+  // A started sign-in is redeemable by whoever holds the device code, and a
+  // human may still approve it after this command returns, so cancelling it on
+  // the server is what a sign-out owes. Dropping the local record alone would
+  // leave the grant live and this machine unable to name it.
+  const pending = await readPendingLogin(profile);
+  const cancelled =
+    pending === null ? true : await postDeviceCancel(origins.authBaseUrl, pending.deviceCode);
+
   await writeStoredCredential(profile, null);
-  log.success('Signed out.');
-  log.result({ signed_out: true });
+  await writePendingLogin(profile, null);
+  const revoked = signedOut && cancelled;
+
+  // The local credential is gone either way, so say so, and name the part
+  // that did not happen rather than reporting a clean sign-out over a
+  // credential that still works.
+  if (revoked) {
+    log.success('Signed out.');
+  } else {
+    log.success(
+      'Signed out on this machine. Brass could not be reached to revoke the sign-in, so run `brass logout` again when it is.',
+    );
+  }
+  log.result({ signed_out: true, revoked });
   return 0;
 }
 
@@ -317,7 +428,7 @@ async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {
   return 0;
 }
 
-async function runPublish(ctx: Context, parsed: ParsedArgs): Promise<unknown> {
+function planPublish(parsed: ParsedArgs): CommandPlan {
   const dir = parsed.positionals[1] ?? 'dist';
   const flagApp = stringFlag(parsed, 'app');
   const envApp = process.env['BRASS_APP_ID'];
@@ -325,26 +436,29 @@ async function runPublish(ctx: Context, parsed: ParsedArgs): Promise<unknown> {
   const org = stringFlag(parsed, 'org');
   const slug = stringFlag(parsed, 'slug');
   const clientToken = stringFlag(parsed, 'client-token');
+  const manifestPath = stringFlag(parsed, 'manifest') ?? 'brass-app.json';
   const visibility = parseVisibilityFlag(stringFlag(parsed, 'visibility'));
   const requireAccess = parseGateFlag(stringFlag(parsed, 'gate'));
-  const state = await readProjectState(ctx.cwd);
-  const appId = resolveAppId({
-    ...(flagApp !== undefined ? { flagApp } : {}),
-    ...(envApp !== undefined ? { envApp } : {}),
-    state,
-    profile: ctx.profile,
-  });
-  return publish(ctx, {
-    dir,
-    manifestPath: stringFlag(parsed, 'manifest') ?? 'brass-app.json',
-    ...(appId !== null ? { appId } : {}),
-    ...(name !== undefined ? { name } : {}),
-    ...(org !== undefined ? { organizationId: org } : {}),
-    ...(clientToken !== undefined ? { clientToken } : {}),
-    ...(slug !== undefined ? { slug } : {}),
-    ...(visibility !== undefined ? { visibility } : {}),
-    ...(requireAccess !== undefined ? { requireAccess } : {}),
-  });
+  return async (ctx): Promise<unknown> => {
+    const state = await readProjectState(ctx.cwd);
+    const appId = resolveAppId({
+      ...(flagApp !== undefined ? { flagApp } : {}),
+      ...(envApp !== undefined ? { envApp } : {}),
+      state,
+      profile: ctx.profile,
+    });
+    return publish(ctx, {
+      dir,
+      manifestPath,
+      ...(appId !== null ? { appId } : {}),
+      ...(name !== undefined ? { name } : {}),
+      ...(org !== undefined ? { organizationId: org } : {}),
+      ...(clientToken !== undefined ? { clientToken } : {}),
+      ...(slug !== undefined ? { slug } : {}),
+      ...(visibility !== undefined ? { visibility } : {}),
+      ...(requireAccess !== undefined ? { requireAccess } : {}),
+    });
+  };
 }
 
 // How long `--wait` holds for the approval: bare `--wait` takes the default,
@@ -386,33 +500,48 @@ function parseGateFlag(value: string | undefined): boolean | undefined {
   return value === 'on';
 }
 
-async function runSchema(ctx: Context, parsed: ParsedArgs): Promise<unknown> {
-  const sub = parsed.positionals[1];
-  if (sub === 'pull') {
-    const docId = stringFlag(parsed, 'doc');
-    if (docId === undefined) throw new Error('brass schema pull requires --doc <docId>');
-    return schemaPull(ctx, { docId, outPath: stringFlag(parsed, 'out') ?? 'brass-app.json' });
+function planSchema(parsed: ParsedArgs): CommandPlan {
+  if (parsed.positionals[1] !== 'pull') {
+    throw new Error('Usage: brass schema pull --doc <docId> [--out brass-app.json]');
   }
-  throw new Error('Usage: brass schema pull --doc <docId> [--out brass-app.json]');
+  const docId = stringFlag(parsed, 'doc');
+  if (docId === undefined) throw new Error('brass schema pull requires --doc <docId>');
+  const outPath = stringFlag(parsed, 'out') ?? 'brass-app.json';
+  return (ctx): Promise<unknown> => schemaPull(ctx, { docId, outPath });
 }
 
-async function runAgents(ctx: Context, parsed: ParsedArgs): Promise<unknown> {
+function planAgents(parsed: ParsedArgs): CommandPlan {
   if (parsed.positionals[1] !== 'pull') {
     throw new Error(
       'Usage: brass agents pull [--out AGENTS.md | --stdout] [--org <organizationId>]',
     );
   }
+  // Both flags claim stdout: `--stdout` puts the instructions there verbatim,
+  // `--json` the result object. Together they interleave two payloads on one
+  // stream, so a caller parsing either reads the other's bytes as part of it.
+  if (boolFlag(parsed, 'stdout') && boolFlag(parsed, 'json')) {
+    throw new Error(
+      'Pass one of --stdout or --json: both write to stdout, so together neither is parseable.',
+    );
+  }
   const org = stringFlag(parsed, 'org');
-  return agentsPull(ctx, {
+  const options = {
     outPath: stringFlag(parsed, 'out') ?? 'AGENTS.md',
     ...(boolFlag(parsed, 'stdout') ? { stdout: true } : {}),
     ...(org !== undefined ? { organizationId: org } : {}),
-  });
+  };
+  return (ctx): Promise<unknown> => agentsPull(ctx, options);
 }
 
-function formatError(err: unknown): string {
+// Render a failure for the terminal, naming the fix for a 401 in the
+// vocabulary of the credential that was actually rejected. A session's
+// refusal already arrives carrying `brass login` (the refresh authors it), so
+// appending a service-token hint there tells the caller to check an
+// environment variable they never set, next to the sentence naming the real
+// fix. `status` classifies the same 401 the same way.
+function formatError(err: unknown, credentialKind?: CredentialKind): string {
   if (err instanceof BrassApiError) {
-    if (err.status === 401) {
+    if (err.status === 401 && credentialKind !== 'session') {
       return `error: ${err.message} (the credential was rejected; check BRASS_SERVICE_TOKEN or --token)`;
     }
     return `error: ${err.message}`;

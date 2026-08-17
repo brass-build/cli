@@ -1,6 +1,6 @@
 {
   "name": "@brass-build/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Brass command-line tool: publish apps and pull schemas from a terminal or CI",
   "type": "module",
   "bin": {

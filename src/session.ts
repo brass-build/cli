@@ -4,17 +4,25 @@
 // code prefilled (and prints the URL + code as a fallback for a headless
 // box), then polls until the human approves. Approval mints the same tokens
 // `/refresh` returns, including the opaque `session_token` the CLI stores to
-// keep refreshing. The CLI's OAuth client is the seeded
-// `brass_app_internal_cli`; its redirect allowlist is the loopback wildcards,
-// which the `/refresh` Origin gate checks the CLI's portless 127.0.0.1 origin
-// against on every later token refresh.
+// keep refreshing, which is bound to the CLI's own app id. That app's
+// registered redirect URLs are the loopback wildcards, which is what lets the
+// portless 127.0.0.1 origin below pass the `/refresh` Origin check on every
+// later token refresh.
 
 import { spawn } from 'node:child_process';
-import { BrassApiError } from './api.js';
+import { BrassApiError, networkError } from './api.js';
 import type { AuthProvider } from './auth.js';
 
-// The seeded CLI OAuth client (see infra/lib/api-stack.ts). Stable across
-// environments, so one CLI build signs in against prod or dev.
+// Every auth call carries a few hundred bytes, so a host still silent after
+// this is one that is not going to answer.
+const AUTH_TIMEOUT_MS = 15_000;
+// Signing out on the server is best effort: `runLogout` clears the local
+// credential whatever this returns, so a host that stalls must not be what
+// stops the credential being cleared.
+const SIGN_OUT_TIMEOUT_MS = 5_000;
+
+// The app id the CLI signs in as. Stable across environments, so one CLI
+// build authenticates against whichever stack the origin flags name.
 export const CLI_APP_ID = 'brass_app_internal_cli';
 
 // The Origin the CLI presents on every `/refresh` call (a command refreshing
@@ -30,7 +38,9 @@ export interface RefreshedTokens {
   idToken: string;
   expiresAt: number;
   // Present only on the initial device-grant token exchange: the opaque
-  // session pointer the CLI persists and echoes on later refreshes.
+  // session pointer the CLI persists and echoes on later refreshes. Bound to
+  // the CLI's app id, so a copy of it authenticates as the CLI and nothing
+  // else.
   sessionToken?: string;
 }
 
@@ -39,6 +49,20 @@ interface RefreshWire {
   id_token: string;
   expires_in: number;
   session_token?: string;
+}
+
+// The lifetime to stamp a token set with, given whatever `expires_in` the
+// response carried. Every value that is not a positive finite number stamps an
+// `expiresAt` the refresh guard `Date.now() >= expiresAt` reads wrong: a
+// missing or non-numeric one makes it NaN, so every comparison is false and
+// the token is never re-refreshed, and a zero or negative one makes it already
+// past, so every call refreshes again. The SDK's `tokenTtlSeconds` is the same
+// guard on the same field.
+const DEFAULT_TOKEN_TTL_SECONDS = 3600;
+function tokenTtlSeconds(expiresIn: unknown): number {
+  return typeof expiresIn === 'number' && Number.isFinite(expiresIn) && expiresIn > 0
+    ? expiresIn
+    : DEFAULT_TOKEN_TTL_SECONDS;
 }
 
 // Refresh an access token at `/refresh` from the stored session pointer
@@ -59,9 +83,10 @@ export async function postRefresh(
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded', origin },
       body,
+      signal: AbortSignal.timeout(AUTH_TIMEOUT_MS),
     });
   } catch (cause) {
-    throw new BrassApiError(0, `Network error reaching ${authBaseUrl}: ${String(cause)}`);
+    throw networkError(`reaching ${authBaseUrl}`, cause);
   }
   if (!response.ok) {
     // Carry the status, and name what a 401 means. Every command reaches the
@@ -76,21 +101,79 @@ export async function postRefresh(
         : `Sign-in exchange failed (${response.status}).`,
     );
   }
-  const json = (await response.json()) as RefreshWire;
+  const json = (await response.json().catch(() => ({}))) as Partial<RefreshWire>;
+  // A 200 carrying no tokens is a failed exchange whatever the status said.
+  // Taken here because the fields are read unchecked otherwise: an absent
+  // `access_token` is stored as `undefined` and presented as the literal
+  // header `Bearer undefined`, which comes back 401 and is reported as an
+  // expired sign-in, sending the caller to `brass login` for a session that
+  // was never the problem. `pollDeviceToken` requires both fields already.
+  if (!json.access_token || !json.id_token) {
+    throw new BrassApiError(
+      response.status,
+      `Sign-in exchange returned no tokens (${response.status}).`,
+    );
+  }
   return {
     accessToken: json.access_token,
     idToken: json.id_token,
-    // Default the lifetime when the server omits it: `undefined * 1000` is
-    // `NaN`, which makes `expiresAt` NaN and the `Date.now() >= expiresAt`
-    // refresh guard permanently false, so the in-process token would never
-    // re-refresh. `pollDeviceToken` already guards the same field.
-    expiresAt: now + (json.expires_in ?? 3600) * 1000,
+    expiresAt: now + tokenTtlSeconds(json.expires_in) * 1000,
     ...(json.session_token ? { sessionToken: json.session_token } : {}),
   };
 }
 
-// Decode the email claim from a Cognito id token, best-effort (used only for
-// the "Signed in as ..." confirmation; never for authorization).
+// End this machine's sign-in on the server, not only in the local
+// credentials file. The stored pointer keeps minting access tokens for the
+// rest of the session's life, so forgetting it locally leaves a working
+// credential behind wherever a copy of the file went.
+//
+// Reports whether the server confirmed it. Every outcome still clears the
+// local credential (the caller asked to be signed out on this machine), so
+// this is what tells the caller whether a credential elsewhere is still live.
+export async function postSignOut(
+  authBaseUrl: string,
+  sid: string,
+  origin: string = REFRESH_ORIGIN,
+): Promise<boolean> {
+  const url = `${authBaseUrl}/sign-out-of-app?${new URLSearchParams({ app_id: CLI_APP_ID }).toString()}`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin },
+      body: new URLSearchParams({ sid }),
+      signal: AbortSignal.timeout(SIGN_OUT_TIMEOUT_MS),
+    });
+    // A 401 means the pointer no longer resolves, which is the state the
+    // caller wanted: there is nothing left to revoke.
+    return response.ok || response.status === 401;
+  } catch {
+    return false;
+  }
+}
+
+// Abandon a sign-in this machine started and never redeemed, so the code it
+// relayed to a human stops being redeemable. Best effort, like `postSignOut`:
+// the caller clears the local record either way, and reports what it could not
+// reach.
+export async function postDeviceCancel(
+  authBaseUrl: string,
+  deviceCode: string,
+): Promise<boolean> {
+  try {
+    const response = await fetch(`${authBaseUrl}/device/cancel`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ device_code: deviceCode, app_id: CLI_APP_ID }),
+      signal: AbortSignal.timeout(SIGN_OUT_TIMEOUT_MS),
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Decode the email claim from an id token, best-effort (used only for the
+// "Signed in as ..." confirmation; never for authorization).
 export function decodeEmail(idToken: string): string | undefined {
   const part = idToken.split('.')[1];
   if (part === undefined) return undefined;
@@ -144,6 +227,7 @@ export async function deviceAuthorize(
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body,
+      signal: AbortSignal.timeout(AUTH_TIMEOUT_MS),
     });
   } catch (cause) {
     throw new Error(`Network error reaching ${authBaseUrl}: ${String(cause)}`);
@@ -190,6 +274,7 @@ export async function pollDeviceTokenOnce(
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body,
+      signal: AbortSignal.timeout(AUTH_TIMEOUT_MS),
     });
   } catch {
     // A transient network error mid-poll: the device grant is still valid
@@ -207,7 +292,7 @@ export async function pollDeviceTokenOnce(
       tokens: {
         accessToken: json.access_token,
         idToken: json.id_token,
-        expiresAt: now + (json.expires_in ?? 3600) * 1000,
+        expiresAt: now + tokenTtlSeconds(json.expires_in) * 1000,
         ...(json.session_token ? { sessionToken: json.session_token } : {}),
       },
     };
@@ -216,9 +301,9 @@ export async function pollDeviceTokenOnce(
   if (json.error === 'access_denied') return { state: 'denied' };
   // RFC 8628 §3.5: polling too fast. The caller backs off.
   if (json.error === 'slow_down') return { state: 'slow_down' };
-  // Everything else — `authorization_pending`, a transient non-2xx (5xx/429),
-  // a non-JSON body, or an error code this pinned CLI does not recognize — is
-  // "keep waiting". The caller's deadline check is the single terminal bound,
+  // Everything else is "keep waiting": `authorization_pending`, a transient
+  // non-2xx (5xx/429), a non-JSON body, or an error code this pinned CLI does
+  // not recognize. The caller's deadline check is the single terminal bound,
   // so an unknown error or a server blip does not abort a sign-in the user is
   // one poll away from completing; a genuinely expired grant simply ends
   // there as a clean timeout.
