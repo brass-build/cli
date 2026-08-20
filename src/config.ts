@@ -53,7 +53,11 @@ export type Profile = string;
 // `BRASS_SERVICE_TOKEN`.
 export interface StoredCredential {
   token?: string;
-  session?: { sid: string };
+  // `authBaseUrl` is the auth origin the session was minted on, so a later
+  // `brass logout` revokes it there even when the invocation's own flags
+  // point elsewhere. Optional: a file an older CLI wrote carries only the
+  // sid, and the logout falls back to the invocation's auth origin.
+  session?: { sid: string; authBaseUrl?: string };
 }
 export interface CredentialsFile {
   version: 1;

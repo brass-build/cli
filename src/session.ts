@@ -127,9 +127,9 @@ export async function postRefresh(
 // rest of the session's life, so forgetting it locally leaves a working
 // credential behind wherever a copy of the file went.
 //
-// Reports whether the server confirmed it. Every outcome still clears the
-// local credential (the caller asked to be signed out on this machine), so
-// this is what tells the caller whether a credential elsewhere is still live.
+// Reports whether the server confirmed it. The stored pointer is the caller's
+// only handle on the session, so what the caller does with the record follows
+// from this: an undelivered revoke keeps it for the retry.
 export async function postSignOut(
   authBaseUrl: string,
   sid: string,
@@ -152,9 +152,9 @@ export async function postSignOut(
 }
 
 // Abandon a sign-in this machine started and never redeemed, so the code it
-// relayed to a human stops being redeemable. Best effort, like `postSignOut`:
-// the caller clears the local record either way, and reports what it could not
-// reach.
+// relayed to a human stops being redeemable. Reports whether the server took
+// it, like `postSignOut`: the record naming the grant is the caller's only
+// handle on it, so what the caller does with the record follows from this.
 export async function postDeviceCancel(
   authBaseUrl: string,
   deviceCode: string,

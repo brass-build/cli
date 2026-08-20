@@ -6,6 +6,17 @@ package follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, minor releases may introduce breaking
 changes.
 
+## 0.3.0
+
+### Changed
+
+- `brass logout` keeps your credentials and exits non-zero when it cannot
+  reach Brass, rather than clearing them and reporting success: only the
+  stored record can name the session to end. Run it again once you have a
+  connection. `--json` reports `signed_out: false`.
+- `brass login --start --new` cancels the sign-in it replaces, so a code you
+  already handed to someone stops working.
+
 ## 0.2.0
 
 ### Added

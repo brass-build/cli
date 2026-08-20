@@ -53,7 +53,9 @@ first. Both phases honor `--json` for a machine-readable result on stdout.
 
 The CLI picks a credential most-explicit first: `--token <token>`, then
 `BRASS_SERVICE_TOKEN`, then the stored `brass login` session. `brass logout`
-forgets the stored session.
+ends that session on the server and forgets it here. It keeps the stored
+session and exits non-zero when it cannot reach Brass, so a retry can still
+name the session to end.
 
 ```sh
 export BRASS_SERVICE_TOKEN=brass_sk_...

@@ -321,7 +321,9 @@ async function runLogin(parsed: ParsedArgs, log: Logger): Promise<number> {
   // The RFC 8628 device grant: open the approval page (code prefilled), print
   // the URL + code as a fallback for a headless box, and poll until approval.
   const result = await loginDevice({ authBaseUrl: origins.authBaseUrl });
-  await writeStoredCredential(profile, { session: { sid: result.sessionToken } });
+  await writeStoredCredential(profile, {
+    session: { sid: result.sessionToken, authBaseUrl: origins.authBaseUrl },
+  });
   log.success(result.email ? `Signed in as ${result.email}.` : 'Signed in.');
   log.result({ signed_in: true, ...(result.email !== undefined ? { email: result.email } : {}) });
   return 0;
@@ -332,35 +334,42 @@ async function runLogout(parsed: ParsedArgs, log: Logger): Promise<number> {
 
   // Revoke on the server first, while the pointer is still readable. A
   // service token belongs to an organization and is revoked in the dashboard,
-  // so only a stored session has anything to end here.
+  // so only a stored session has anything to end here. The session is revoked
+  // on the auth origin it was minted on: profiles key on the api host, so the
+  // invocation's own auth flag can name a different stack, where an unknown
+  // pointer reads as already-signed-out and the real session stays live.
   const file = await readCredentialsFile();
-  const stored = file?.credentials[profile]?.session?.sid;
-  const signedOut = stored === undefined ? true : await postSignOut(origins.authBaseUrl, stored);
+  const session = file?.credentials[profile]?.session;
+  const signedOut =
+    session === undefined
+      ? true
+      : await postSignOut(session.authBaseUrl ?? origins.authBaseUrl, session.sid);
 
   // A started sign-in is redeemable by whoever holds the device code, and a
   // human may still approve it after this command returns, so cancelling it on
-  // the server is what a sign-out owes. Dropping the local record alone would
-  // leave the grant live and this machine unable to name it.
+  // the server is what a sign-out owes. The grant, too, is cancelled on the
+  // auth origin that minted it.
   const pending = await readPendingLogin(profile);
   const cancelled =
-    pending === null ? true : await postDeviceCancel(origins.authBaseUrl, pending.deviceCode);
+    pending === null ? true : await postDeviceCancel(pending.authBaseUrl, pending.deviceCode);
 
-  await writeStoredCredential(profile, null);
-  await writePendingLogin(profile, null);
+  // Each record is dropped only once its server side is revoked. The record
+  // is the one handle that can name the session or grant to the server, so a
+  // failed delivery keeps it, which is what makes the retry this command
+  // recommends able to revoke anything.
+  if (signedOut) await writeStoredCredential(profile, null);
+  if (cancelled) await writePendingLogin(profile, null);
   const revoked = signedOut && cancelled;
 
-  // The local credential is gone either way, so say so, and name the part
-  // that did not happen rather than reporting a clean sign-out over a
-  // credential that still works.
   if (revoked) {
     log.success('Signed out.');
   } else {
-    log.success(
-      'Signed out on this machine. Brass could not be reached to revoke the sign-in, so run `brass logout` again when it is.',
+    log.warn(
+      'Brass could not be reached to revoke the sign-in, so it is kept on this machine. Run `brass logout` again when Brass is reachable.',
     );
   }
-  log.result({ signed_out: true, revoked });
-  return 0;
+  log.result({ signed_out: revoked, revoked });
+  return revoked ? 0 : 1;
 }
 
 async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {

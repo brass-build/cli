@@ -14,7 +14,7 @@
 // place with a fresh one whose code is printed. A caller that has to relay a
 // second code because the first expired is the cost being avoided.
 
-import { deviceAuthorize, pollDeviceTokenOnce, decodeEmail } from './session.js';
+import { deviceAuthorize, pollDeviceTokenOnce, postDeviceCancel, decodeEmail } from './session.js';
 import {
   readPendingLogin,
   writePendingLogin,
@@ -56,9 +56,21 @@ export async function loginStart(options: LoginStartOptions): Promise<number> {
   // second code and forgets the first, so an approval the human is part-way
   // through completes a grant the CLI can no longer redeem and they are asked
   // to sign in again.
-  const existing = options.force === true ? null : await readPendingLogin(options.profile, env);
+  const existing = await readPendingLogin(options.profile, env);
   const resumed =
-    existing !== null && existing.expiresAt - now() > MIN_USABLE_REMAINING_MS ? existing : null;
+    options.force !== true &&
+    existing !== null &&
+    existing.expiresAt - now() > MIN_USABLE_REMAINING_MS
+      ? existing
+      : null;
+  // A superseded grant that is still live stays approvable on the server for
+  // the rest of its TTL while this machine forgets the only copy of its
+  // device code, so cancel it before the record is overwritten. Best-effort:
+  // an undelivered cancel leaves a grant nobody can redeem from here, and the
+  // new grant is the one this command is for.
+  if (resumed === null && existing !== null && existing.expiresAt > now()) {
+    await postDeviceCancel(existing.authBaseUrl, existing.deviceCode);
+  }
   const pending = resumed ?? (await mintPendingLogin(options.authBaseUrl, now(), options.profile, env));
   promptFor(options.log, pending, {
     lead: resumed === null ? null : 'A sign-in is already waiting for approval.',
@@ -135,7 +147,7 @@ export async function loginCheck(options: LoginCheckOptions): Promise<number> {
       }
       await writeStoredCredential(
         options.profile,
-        { session: { sid: outcome.tokens.sessionToken } },
+        { session: { sid: outcome.tokens.sessionToken, authBaseUrl: pending.authBaseUrl } },
         env,
       );
       await writePendingLogin(options.profile, null, env);
