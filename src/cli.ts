@@ -23,25 +23,44 @@ import {
 } from './config.js';
 import {
   readCredentialsFile,
+  readPendingApproval,
   readPendingLogin,
+  writePendingApproval,
   writePendingLogin,
   writeStoredCredential,
 } from './store.js';
 import { BrassApi, BrassApiError, type AppVisibility } from './api.js';
 import { serviceTokenAuth, type AuthProvider } from './auth.js';
-import { loginDevice, postDeviceCancel, postSignOut, sessionAuth } from './session.js';
+import {
+  loginDevice,
+  postDeviceAppSession,
+  postDeviceCancel,
+  postSignOut,
+  sessionAuth,
+} from './session.js';
 import { loginStart, loginCheck } from './login.js';
+import { renderApprovalPrompt } from './approval-prompt.js';
 import { createLogger, type Logger } from './log.js';
 import {
   publish,
   schemaPull,
+  documentContents,
   agentsPull,
   whoami,
   status,
   type CommandContext,
   type CredentialKind,
 } from './commands.js';
-import { readProjectState, resolveAppId, readManifest } from './project.js';
+import {
+  readProjectState,
+  resolveAppId,
+  loadFirstManifest,
+  firstExistingManifestPath,
+  publishManifestCandidates,
+  sourceManifestCandidates,
+  MANIFEST_FILENAME,
+  type AppManifest,
+} from './project.js';
 
 import { VERSION } from './version.js';
 
@@ -57,10 +76,21 @@ Usage:
                              --wait [seconds] polls until approved (default 120s), renewing
                              an expired code in place and printing the new one.
   brass logout               End the stored sign-in for this environment, here and on the server.
-  brass status [dir]         Report the credential + app state and the one command to run next.
+  brass browser-session --return-to <url> [--app <appId>]
+                             Print a URL that opens <url> signed in as you, for a browser
+                             you drive. The URL is single-use and expires in two minutes.
+  brass status [dir] [--app <appId>]
+                             Report the credential + app state and the one command to run next.
   brass publish [dir]        Build output in [dir] (default: dist) is deployed to the app's hosting.
   brass schema pull --doc <docId> [--out brass-app.json]
                              Fetch a document's schema and write it into a manifest, verbatim.
+  brass contents --doc <docId> [--out contents.json | --stdout] [--stream <name>] [--branch <id>]
+                             Write everything a document holds as JSON: every
+                             root container, read whole. The whole document,
+                             not a sample, so every record type it carries is
+                             in the file. A document still being imported is
+                             waited out (--wait <seconds> moves the deadline,
+                             default 900; --no-wait reads once and fails).
   brass agents pull [--out AGENTS.md | --stdout] [--org <organizationId>]
                              Write your organization's agent instructions (its
                              AGENTS.md / CLAUDE.md) to a file, or --stdout to print
@@ -71,11 +101,23 @@ Usage:
 Authentication:
   Run 'brass login' to sign in with your browser (needed for schema pull),
   or set BRASS_SERVICE_TOKEN to a service token minted in the dashboard
-  (org Settings -> Service tokens) for CI, or pass --token <token>.
+  (org Settings -> Access tokens) for CI, or pass --token <token>.
 
 Common flags:
   --token <token>            Service token to authenticate with.
   --json                     Emit the machine-readable result on stdout.
+
+Status flags:
+  --app <appId>             Report on a specific app (else .brass/project.json / BRASS_APP_ID).
+
+Sign-in flags:
+  --app <appId>             Approve an app you do not own for the sign-in as
+                            well, so 'brass browser-session' needs no second
+                            approval. An app you own never does.
+
+Browser-session flags:
+  --return-to <url>         Where the browser lands, on the app's redirect allowlist.
+  --app <appId>             The app to sign in to (else .brass/project.json / BRASS_APP_ID).
 
 Publish flags:
   --app <appId>             Publish to a specific app (else .brass/project.json / BRASS_APP_ID).
@@ -162,6 +204,12 @@ export async function run(argv: readonly string[]): Promise<number> {
     // one is obtained); everything else needs a resolved credential.
     if (command === 'login') return await runLogin(parsed, log);
     if (command === 'logout') return await runLogout(parsed, log);
+    // Reads the stored device pointer directly rather than through
+    // `buildContext`: what the handoff route takes is that credential, not an
+    // access token minted from it.
+    if (command === 'browser-session') {
+      return await runBrowserSession(parsed, log, boolFlag(parsed, 'json'));
+    }
     // status runs before a credential is required: reporting "no credential"
     // (and the next step to obtain one) is a first-class outcome, not an error.
     if (command === 'status') return await runStatus(parsed, log);
@@ -193,7 +241,7 @@ type Context = CommandContext;
 
 // The commands that need a resolved credential; `login` / `logout` / `status`
 // are answered above without one.
-const CREDENTIALED_COMMANDS = ['publish', 'schema', 'agents', 'whoami'] as const;
+const CREDENTIALED_COMMANDS = ['publish', 'schema', 'contents', 'agents', 'whoami'] as const;
 type CredentialedCommand = (typeof CREDENTIALED_COMMANDS)[number];
 
 function isCredentialedCommand(value: string): value is CredentialedCommand {
@@ -212,6 +260,8 @@ function planCommand(command: CredentialedCommand, parsed: ParsedArgs): CommandP
       return planPublish(parsed);
     case 'schema':
       return planSchema(parsed);
+    case 'contents':
+      return planContents(parsed);
     case 'agents':
       return planAgents(parsed);
     case 'whoami':
@@ -283,7 +333,7 @@ async function resolveAuth(
   });
   if (credential === null) {
     throw new Error(
-      'No credential. Run `brass login`, or set BRASS_SERVICE_TOKEN (mint one in the dashboard: org Settings -> Service tokens), or pass --token.',
+      'No credential. Run `brass login`, or set BRASS_SERVICE_TOKEN (mint one in the dashboard: org Settings -> Access tokens), or pass --token.',
     );
   }
   const auth =
@@ -300,13 +350,17 @@ async function runLogin(parsed: ParsedArgs, log: Logger): Promise<number> {
   // interactive flow.
   const start = boolFlag(parsed, 'start');
   const check = boolFlag(parsed, 'check');
-  const waitSeconds = parseWaitFlag(parsed);
+  const waitSeconds = parseWaitFlag(parsed, DEFAULT_WAIT_SECONDS);
   if (start && check) throw new Error('Pass one of --start or --check.');
+  // The app this sign-in should also approve, so the human's one click covers
+  // the machine and the app it is about to hand a browser.
+  const targetAppId = stringFlag(parsed, 'app');
   if (start) {
     const code = await loginStart({
       authBaseUrl: origins.authBaseUrl,
       profile,
       log,
+      ...(targetAppId !== undefined ? { targetAppId } : {}),
       ...(boolFlag(parsed, 'new') ? { force: true } : {}),
       ...(waitSeconds !== undefined ? { resultFollows: true } : {}),
     });
@@ -320,7 +374,10 @@ async function runLogin(parsed: ParsedArgs, log: Logger): Promise<number> {
   }
   // The RFC 8628 device grant: open the approval page (code prefilled), print
   // the URL + code as a fallback for a headless box, and poll until approval.
-  const result = await loginDevice({ authBaseUrl: origins.authBaseUrl });
+  const result = await loginDevice({
+    authBaseUrl: origins.authBaseUrl,
+    ...(targetAppId !== undefined ? { targetAppId } : {}),
+  });
   await writeStoredCredential(profile, {
     session: { sid: result.sessionToken, authBaseUrl: origins.authBaseUrl },
   });
@@ -372,6 +429,103 @@ async function runLogout(parsed: ParsedArgs, log: Logger): Promise<number> {
   return revoked ? 0 : 1;
 }
 
+// `brass browser-session`: turn this machine's sign-in into a URL that signs a
+// browser in as the same human, so an agent that just built an app can open it
+// and drive it rather than reporting it verified by types.
+//
+// The URL is what the command is for, so in the plain form it goes to stdout
+// alone and the guidance to stderr, and `--json` puts it in the result object
+// instead. Either way it is a credential with a two-minute life: it belongs in
+// the browser being driven, not in a log or a commit.
+async function runBrowserSession(
+  parsed: ParsedArgs,
+  log: Logger,
+  json: boolean,
+): Promise<number> {
+  const { origins, profile } = resolveBase(parsed);
+  const returnTo = stringFlag(parsed, 'return-to');
+  if (returnTo === undefined) {
+    throw new Error(
+      'brass browser-session requires --return-to <url> (where the browser should land)',
+    );
+  }
+  const state = await readProjectState(process.cwd());
+  const flagApp = stringFlag(parsed, 'app');
+  const envApp = process.env['BRASS_APP_ID'];
+  const appId = resolveAppId({
+    ...(flagApp !== undefined ? { flagApp } : {}),
+    ...(envApp !== undefined ? { envApp } : {}),
+    state,
+    profile,
+  });
+  if (appId === null) {
+    throw new Error(
+      'No app to sign in to. Pass --app <appId>, or run this from a directory `brass publish` has written .brass/project.json in.',
+    );
+  }
+
+  // The device pointer itself, not an access token minted from it: the handoff
+  // route authenticates the machine, and only that credential names one. A
+  // service token belongs to an organization rather than to a person, so it
+  // has no session for a browser to be handed.
+  const file = await readCredentialsFile();
+  const session = file?.credentials[profile]?.session;
+  if (session === undefined) {
+    throw new Error(
+      'No Brass sign-in on this machine. Run `brass login` (a service token cannot be handed to a browser).',
+    );
+  }
+
+  const outcome = await postDeviceAppSession(
+    session.authBaseUrl ?? origins.authBaseUrl,
+    session.sid,
+    { appId, returnTo },
+  );
+  if (outcome.state === 'needs_approval') {
+    // Recorded so `brass status` can report what is outstanding. A caller that
+    // relays the URL and then asks status what to do next is otherwise told
+    // the app is ready, which is true of publishing and false of the thing it
+    // was doing.
+    await writePendingApproval(profile, {
+      appId,
+      approvalUrl: outcome.approvalUrl,
+      authBaseUrl: session.authBaseUrl ?? origins.authBaseUrl,
+      expiresAt: Date.now() + outcome.expiresIn * 1000,
+    });
+    // Through the same frame the sign-in's approval prints in, and with the
+    // same relay note: this is the same request with a different subject, and
+    // it reaches the human only if whoever runs this passes it on.
+    log.info(
+      `\n${renderApprovalPrompt({
+        heading: ` To open ${appId} in a browser, it needs approving for this machine.`,
+        url: outcome.approvalUrl,
+        relaying: true,
+        closing:
+          'The person approving must be signed in to Brass as the account this ' +
+          'machine is signed in as.\nThen run this command again.',
+      })}`,
+    );
+    log.result({ state: 'needs_approval', app_id: appId, approval_url: outcome.approvalUrl });
+    return 1;
+  }
+  await writePendingApproval(profile, null);
+  if (json) {
+    log.result({
+      state: 'ready',
+      url: outcome.url,
+      app_id: appId,
+      return_to: returnTo,
+      expires_in_seconds: outcome.expiresIn,
+    });
+  } else {
+    log.info(
+      `Open this in the browser you are driving, within ${outcome.expiresIn} seconds. It signs in once and cannot be reused.`,
+    );
+    log.write(`${outcome.url}\n`);
+  }
+  return 0;
+}
+
 async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {
   const { origins, profile } = resolveBase(parsed);
 
@@ -409,13 +563,28 @@ async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {
     state,
     profile,
   });
-  const manifest = await readManifest(stringFlag(parsed, 'manifest') ?? 'brass-app.json');
+  const manifestFlag = stringFlag(parsed, 'manifest');
+  // `status` reports rather than acts, so a manifest that cannot be parsed is
+  // named and the rest of the report still runs. Publishing that same tree
+  // fails on it, which is the point at which it has to be fixed.
+  let manifest: AppManifest | undefined;
+  try {
+    manifest = (
+      await loadFirstManifest(
+        cwd,
+        manifestFlag !== undefined ? [manifestFlag] : publishManifestCandidates(dir),
+      )
+    )?.manifest;
+  } catch (err) {
+    log.warn(err instanceof Error ? err.message : String(err));
+  }
   const manifestName =
     typeof manifest?.name === 'string' && manifest.name.trim() !== ''
       ? manifest.name.trim()
       : null;
 
   const pending = await readPendingLogin(profile);
+  const pendingApproval = await readPendingApproval(profile);
   const result = await status({
     api,
     profile,
@@ -432,6 +601,7 @@ async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {
             verificationUrl: pending.verificationUriComplete ?? pending.verificationUri,
             expiresAt: pending.expiresAt,
           },
+    pendingApproval,
   });
   log.result(result);
   return 0;
@@ -445,7 +615,7 @@ function planPublish(parsed: ParsedArgs): CommandPlan {
   const org = stringFlag(parsed, 'org');
   const slug = stringFlag(parsed, 'slug');
   const clientToken = stringFlag(parsed, 'client-token');
-  const manifestPath = stringFlag(parsed, 'manifest') ?? 'brass-app.json';
+  const manifestPath = stringFlag(parsed, 'manifest');
   const visibility = parseVisibilityFlag(stringFlag(parsed, 'visibility'));
   const requireAccess = parseGateFlag(stringFlag(parsed, 'gate'));
   return async (ctx): Promise<unknown> => {
@@ -458,7 +628,7 @@ function planPublish(parsed: ParsedArgs): CommandPlan {
     });
     return publish(ctx, {
       dir,
-      manifestPath,
+      ...(manifestPath !== undefined ? { manifestPath } : {}),
       ...(appId !== null ? { appId } : {}),
       ...(name !== undefined ? { name } : {}),
       ...(org !== undefined ? { organizationId: org } : {}),
@@ -476,11 +646,19 @@ function planPublish(parsed: ParsedArgs): CommandPlan {
 // so a second check resumes the same sign-in.
 const DEFAULT_WAIT_SECONDS = 120;
 const MAX_WAIT_SECONDS = 3600;
+// `brass contents` waits by default, so its `--wait` only moves the budget.
+// The default is the extraction worker's own ceiling: past it the run has
+// stopped rather than slowed.
+const CONTENTS_WAIT_SECONDS = 900;
 
-function parseWaitFlag(parsed: ParsedArgs): number | undefined {
+// `--wait` with no value means "the command's own default deadline", which
+// differs per command, so the default is the caller's to name. `undefined`
+// back means the flag was absent, which each command reads for itself: the
+// sign-in poll does not wait at all, and a document read waits anyway.
+function parseWaitFlag(parsed: ParsedArgs, bareValue: number): number | undefined {
   const raw = parsed.flags['wait'];
   if (raw === undefined) return undefined;
-  if (raw === true) return DEFAULT_WAIT_SECONDS;
+  if (raw === true) return bareValue;
   const seconds = Number(raw);
   if (!Number.isInteger(seconds) || seconds <= 0 || seconds > MAX_WAIT_SECONDS) {
     throw new Error(`Invalid --wait "${raw}" (expected whole seconds, 1 to ${MAX_WAIT_SECONDS})`);
@@ -509,14 +687,52 @@ function parseGateFlag(value: string | undefined): boolean | undefined {
   return value === 'on';
 }
 
+function planContents(parsed: ParsedArgs): CommandPlan {
+  const docId = stringFlag(parsed, 'doc');
+  if (docId === undefined) throw new Error('brass contents requires --doc <docId>');
+  const toStdout = boolFlag(parsed, 'stdout');
+  const outPath = stringFlag(parsed, 'out');
+  // Both name where the JSON goes, so together neither answer is the one the
+  // caller gets.
+  if (toStdout && outPath !== undefined) {
+    throw new Error('Pass one of --stdout or --out, not both');
+  }
+  // A document whose content is still being prepared is waited out rather
+  // than refused, because this command's own join is what starts that work.
+  // The two flags name the same budget from opposite ends, so together
+  // neither answer is the one the caller gets.
+  const noWait = boolFlag(parsed, 'no-wait');
+  const waitSeconds = parseWaitFlag(parsed, CONTENTS_WAIT_SECONDS);
+  if (noWait && waitSeconds !== undefined) {
+    throw new Error('Pass one of --wait or --no-wait, not both');
+  }
+  const opts = {
+    docId,
+    stream: stringFlag(parsed, 'stream'),
+    branch: stringFlag(parsed, 'branch'),
+    outPath: toStdout ? null : (outPath ?? 'contents.json'),
+    waitMs: noWait ? 0 : (waitSeconds ?? CONTENTS_WAIT_SECONDS) * 1000,
+  };
+  return (ctx): Promise<unknown> => documentContents(ctx, opts);
+}
+
 function planSchema(parsed: ParsedArgs): CommandPlan {
   if (parsed.positionals[1] !== 'pull') {
     throw new Error('Usage: brass schema pull --doc <docId> [--out brass-app.json]');
   }
   const docId = stringFlag(parsed, 'doc');
   if (docId === undefined) throw new Error('brass schema pull requires --doc <docId>');
-  const outPath = stringFlag(parsed, 'out') ?? 'brass-app.json';
-  return (ctx): Promise<unknown> => schemaPull(ctx, { docId, outPath });
+  const outFlag = stringFlag(parsed, 'out');
+  return async (ctx): Promise<unknown> => {
+    // Merge into the manifest the repo already keeps rather than writing a
+    // second one beside it: a pulled schema in a file the bundle never serves
+    // is a schema the platform never reads.
+    const outPath =
+      outFlag ??
+      (await firstExistingManifestPath(ctx.cwd, sourceManifestCandidates())) ??
+      MANIFEST_FILENAME;
+    return schemaPull(ctx, { docId, outPath });
+  };
 }
 
 function planAgents(parsed: ParsedArgs): CommandPlan {

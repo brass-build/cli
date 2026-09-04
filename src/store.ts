@@ -47,6 +47,9 @@ export async function writeStoredCredential(
 export interface PendingLogin {
   authBaseUrl: string;
   deviceCode: string;
+  // The app named by `brass login --app`, carried so a grant this CLI renews
+  // in place asks for the same approval the relayed one did.
+  targetAppId?: string;
   userCode: string;
   verificationUri: string;
   verificationUriComplete?: string;
@@ -110,6 +113,80 @@ export async function writePendingLogin(
     version: 1,
     pending: entries,
   } satisfies PendingLoginsFile);
+}
+
+// An app approval `brass browser-session` asked for and no one has granted
+// yet. Recorded for the same reason a pending sign-in is: the caller relayed a
+// URL to a human and now has to wait, and `brass status` is where it asks what
+// is outstanding. Without it, status reports the app as ready and names a next
+// step that is not the blocked one.
+//
+// One per profile, carrying the app it is for, so status reports it only
+// against the app it resolved. A second app asked about while a first is
+// pending overwrites it; the link it replaces stays valid on the server, and
+// re-running the command for that app reports it again.
+export interface PendingApproval {
+  appId: string;
+  approvalUrl: string;
+  authBaseUrl: string;
+  expiresAt: number;
+}
+
+interface PendingApprovalsFile {
+  version: 1;
+  pending: Record<Profile, PendingApproval>;
+}
+
+export function pendingApprovalFilePath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(dirname(credentialsFilePath(env)), 'pending-approval.json');
+}
+
+async function readPendingApprovalsFile(
+  env: NodeJS.ProcessEnv,
+): Promise<PendingApprovalsFile | null> {
+  try {
+    const raw = await readFile(pendingApprovalFilePath(env), 'utf8');
+    const parsed = JSON.parse(raw) as PendingApprovalsFile;
+    if (parsed.version !== 1 || typeof parsed.pending !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export async function readPendingApproval(
+  profile: Profile,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<PendingApproval | null> {
+  const entry = (await readPendingApprovalsFile(env))?.pending[profile];
+  if (
+    entry === undefined ||
+    typeof entry.appId !== 'string' ||
+    typeof entry.approvalUrl !== 'string' ||
+    typeof entry.expiresAt !== 'number'
+  ) {
+    return null;
+  }
+  return entry;
+}
+
+// The approval URL names a question rather than carrying a credential (the
+// page still gates on the reader's own cookie), but the file is written
+// owner-only like its siblings: what it discloses is which machine is asking
+// about which app.
+export async function writePendingApproval(
+  profile: Profile,
+  pending: PendingApproval | null,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const existing = (await readPendingApprovalsFile(env)) ?? { version: 1 as const, pending: {} };
+  const entries = { ...existing.pending };
+  if (pending === null) delete entries[profile];
+  else entries[profile] = pending;
+  await writeOwnerOnlyJson(pendingApprovalFilePath(env), {
+    version: 1,
+    pending: entries,
+  } satisfies PendingApprovalsFile);
 }
 
 async function writeOwnerOnlyJson(path: string, payload: unknown): Promise<void> {

@@ -6,6 +6,24 @@ package follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, minor releases may introduce breaking
 changes.
 
+## 0.4.0
+
+### Added
+
+- `brass contents --doc <docId>` writes a document out as JSON, so you can
+  build and test against the data your app will really see rather than
+  against a fixture you wrote by hand. Each root container is a key,
+  holding what `doc.map(root)` and `doc.list(root)` return.
+- `brass browser-session --return-to <url>` prints a single-use URL that opens
+  your app signed in as you, so a coding agent driving a browser can check its
+  work as a signed-in user.
+
+### Changed
+
+- `brass publish` and `brass schema pull` look for `brass-app.json` in the
+  current directory and the common bundle locations, so neither needs
+  `--manifest` or `--out` unless the manifest sits somewhere else.
+
 ## 0.3.0
 
 ### Changed

@@ -21,6 +21,7 @@ import {
   writeStoredCredential,
   type PendingLogin,
 } from './store.js';
+import { renderApprovalPrompt } from './approval-prompt.js';
 import type { Logger } from './log.js';
 import type { Profile } from './config.js';
 
@@ -37,6 +38,9 @@ export interface LoginStartOptions {
   // Mint a fresh grant even when a usable one is pending (`--new`), for a
   // human who lost the relayed code.
   force?: boolean;
+  // The app to approve alongside the CLI (`--app`), so one human action
+  // covers the sign-in and the app the machine will hand a browser.
+  targetAppId?: string;
   // Set when a wait follows in the same command (`--start --wait`), whose own
   // terminal result is the one the caller reads. `--json` is one document per
   // run, so the started state prints to the human stream only.
@@ -71,7 +75,9 @@ export async function loginStart(options: LoginStartOptions): Promise<number> {
   if (resumed === null && existing !== null && existing.expiresAt > now()) {
     await postDeviceCancel(existing.authBaseUrl, existing.deviceCode);
   }
-  const pending = resumed ?? (await mintPendingLogin(options.authBaseUrl, now(), options.profile, env));
+  const pending =
+    resumed ??
+    (await mintPendingLogin(options.authBaseUrl, now(), options.profile, env, options.targetAppId));
   promptFor(options.log, pending, {
     lead: resumed === null ? null : 'A sign-in is already waiting for approval.',
   });
@@ -131,7 +137,13 @@ export async function loginCheck(options: LoginCheckOptions): Promise<number> {
 
   for (;;) {
     if (now() >= pending.expiresAt) {
-      pending = await mintPendingLogin(pending.authBaseUrl, now(), options.profile, env);
+      pending = await mintPendingLogin(
+        pending.authBaseUrl,
+        now(),
+        options.profile,
+        env,
+        pending.targetAppId,
+      );
       intervalSeconds = pending.intervalSeconds;
       renewed = true;
       promptFor(options.log, pending, {
@@ -190,11 +202,13 @@ async function mintPendingLogin(
   now: number,
   profile: Profile,
   env: NodeJS.ProcessEnv,
+  targetAppId?: string,
 ): Promise<PendingLogin> {
-  const auth = await deviceAuthorize(authBaseUrl, now);
+  const auth = await deviceAuthorize(authBaseUrl, now, targetAppId);
   const pending: PendingLogin = {
     authBaseUrl,
     deviceCode: auth.deviceCode,
+    ...(targetAppId !== undefined ? { targetAppId } : {}),
     userCode: auth.userCode,
     verificationUri: auth.verificationUri,
     ...(auth.verificationUriComplete !== undefined
@@ -215,15 +229,14 @@ function remainingSeconds(pending: PendingLogin, now: number): number {
   return Math.max(0, Math.round((pending.expiresAt - now) / 1000));
 }
 
-// The one rendering of "here is what to relay, and here is what to run next",
-// so a resumed, renewed, and freshly minted grant all read the same to whoever
-// is relaying it.
 function promptFor(log: Logger, pending: PendingLogin, opts: { lead: string | null }): void {
   log.info(
-    (opts.lead !== null ? `${opts.lead}\n` : '') +
-      'To approve this sign-in, go to:\n' +
-      `  ${targetUrl(pending)}\n` +
-      `and confirm the code:  ${pending.userCode}\n` +
-      '\nThen run `brass login --check --wait` to finish signing in.',
+    renderApprovalPrompt({
+      url: targetUrl(pending),
+      code: pending.userCode,
+      lead: opts.lead,
+      nextCommand: 'brass login --check --wait',
+      relaying: true,
+    }),
   );
 }

@@ -1,5 +1,5 @@
 import { readFile, writeFile, readdir, stat, mkdir, realpath } from 'node:fs/promises';
-import { join, relative, sep, dirname } from 'node:path';
+import { join, relative, resolve, sep, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { zipSync } from 'fflate';
 import type { BrassSchemaManifest } from './api.js';
@@ -84,15 +84,90 @@ export interface AppManifest {
   [key: string]: unknown;
 }
 
+// The manifest filename, and the bundle-relative directory the capability
+// docs put it in.
+export const MANIFEST_FILENAME = 'brass-app.json';
+const WELL_KNOWN_DIR = '.well-known';
+
+// Where `publish` and `status` look for the served manifest, most
+// authoritative first. The copy inside the bundle is the one the platform
+// reads back after a deploy, so it outranks the repo root, which is the flat
+// layout an app that keeps its manifest beside `package.json` uses.
+export function publishManifestCandidates(dir: string): string[] {
+  return [join(dir, WELL_KNOWN_DIR, MANIFEST_FILENAME), MANIFEST_FILENAME];
+}
+
+// Where `schema pull` looks for a manifest to merge a pulled schema into.
+// Source locations only: a bundler rewrites its output directory on the next
+// build, so a schema written there is gone before the app is published. Each
+// candidate is used only when it already holds a file, so a layout this list
+// does not name falls back to the root default rather than being guessed at.
+export function sourceManifestCandidates(): string[] {
+  return [
+    MANIFEST_FILENAME,
+    join(WELL_KNOWN_DIR, MANIFEST_FILENAME),
+    join('public', WELL_KNOWN_DIR, MANIFEST_FILENAME),
+    join('static', WELL_KNOWN_DIR, MANIFEST_FILENAME),
+  ];
+}
+
+// Absent means no file at this path, which is what lets a caller walk a
+// candidate list. Every other failure throws: a manifest that exists and
+// cannot be parsed is a mistake to report, and answering it with `null` drops
+// the `name` and `client_token` it was written to carry, which reads as a
+// missing manifest and creates a duplicate app on the next stateless run.
 export async function readManifest(path: string): Promise<AppManifest | null> {
+  let raw: string;
   try {
-    const raw = await readFile(path, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    if (typeof parsed !== 'object' || parsed === null) return null;
-    return parsed as AppManifest;
-  } catch {
-    return null;
+    raw = await readFile(path, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return null;
+    throw new Error(`Could not read the manifest at ${path}: ${(err as Error).message}`);
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch (err) {
+    throw new Error(`The manifest at ${path} is not valid JSON: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`The manifest at ${path} must hold a JSON object.`);
+  }
+  return parsed as AppManifest;
+}
+
+// The first candidate that holds a manifest, paired with the path it came
+// from so a caller can name it. A candidate with no file is skipped; one that
+// is present and unreadable throws out of `readManifest`, so a malformed
+// manifest is reported rather than passed over for the next candidate down.
+export async function loadFirstManifest(
+  cwd: string,
+  candidates: readonly string[],
+): Promise<{ path: string; manifest: AppManifest } | null> {
+  for (const candidate of candidates) {
+    const manifest = await readManifest(resolve(cwd, candidate));
+    if (manifest !== null) return { path: candidate, manifest };
+  }
+  return null;
+}
+
+// The first candidate that holds a file, without parsing it. `schema pull`
+// picks its destination this way so it merges into a malformed manifest's
+// path and fails there, instead of stepping over it and writing a second
+// manifest the bundle never serves.
+export async function firstExistingManifestPath(
+  cwd: string,
+  candidates: readonly string[],
+): Promise<string | null> {
+  for (const candidate of candidates) {
+    try {
+      if ((await stat(resolve(cwd, candidate))).isFile()) return candidate;
+    } catch {
+      // Not there, or not reachable through this path. Try the next.
+    }
+  }
+  return null;
 }
 
 export async function writeManifest(path: string, manifest: AppManifest): Promise<void> {

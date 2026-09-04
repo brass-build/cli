@@ -23,6 +23,7 @@ const BOOLEAN_FLAGS = new Set([
   'start',
   'check',
   'new',
+  'no-wait',
 ]);
 
 // Every flag any command reads. A flag outside this set is rejected rather
@@ -35,6 +36,7 @@ const KNOWN_FLAGS = new Set([
   'api-url',
   'app',
   'auth-url',
+  'branch',
   'client-token',
   'dashboard-url',
   'doc',
@@ -43,7 +45,9 @@ const KNOWN_FLAGS = new Set([
   'name',
   'org',
   'out',
+  'return-to',
   'slug',
+  'stream',
   'token',
   'visibility',
   'wait',
@@ -73,8 +77,9 @@ const COMMON_FLAGS = [
 // exactly as long as it would have without the flag. Refusing it names the
 // mistake, where accepting it leaves the caller believing they set something.
 const COMMAND_ARGS: Record<string, { flags: readonly string[]; positionals: number }> = {
-  login: { flags: ['check', 'new', 'start', 'wait'], positionals: 1 },
+  login: { flags: ['app', 'check', 'new', 'start', 'wait'], positionals: 1 },
   logout: { flags: [], positionals: 1 },
+  'browser-session': { flags: ['app', 'return-to'], positionals: 1 },
   status: { flags: ['app', 'manifest', 'token'], positionals: 2 },
   publish: {
     flags: [
@@ -89,6 +94,10 @@ const COMMAND_ARGS: Record<string, { flags: readonly string[]; positionals: numb
       'visibility',
     ],
     positionals: 2,
+  },
+  contents: {
+    flags: ['branch', 'doc', 'no-wait', 'out', 'stdout', 'stream', 'token', 'wait'],
+    positionals: 1,
   },
   schema: { flags: ['doc', 'out', 'token'], positionals: 2 },
   agents: { flags: ['org', 'out', 'stdout', 'token'], positionals: 2 },

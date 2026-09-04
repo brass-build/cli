@@ -11,6 +11,7 @@
 
 import { spawn } from 'node:child_process';
 import { BrassApiError, networkError } from './api.js';
+import { renderApprovalPrompt } from './approval-prompt.js';
 import type { AuthProvider } from './auth.js';
 
 // Every auth call carries a few hundred bytes, so a host still silent after
@@ -151,6 +152,77 @@ export async function postSignOut(
   }
 }
 
+export type BrowserSessionOutcome =
+  | { state: 'ready'; url: string; expiresIn: number }
+  // The app is not approved for the platform session behind this machine's
+  // sign-in. The URL is a page the human opens to grant it; the mint is a
+  // re-run of the same command afterwards.
+  | { state: 'needs_approval'; approvalUrl: string; expiresIn: number };
+
+interface BrowserSessionWire {
+  url?: string;
+  expires_in?: number;
+  error?: string;
+  error_description?: string;
+  approval_url?: string;
+}
+
+// Ask the auth API for a URL that signs a browser in as the human this
+// machine is signed in as. The stored device pointer is the credential, and
+// the answer is `return_to` with a one-time code on it, so what reaches the
+// browser expires in minutes and is spent once.
+//
+// The URL is a credential for as long as it lives. It belongs in the browser
+// the caller is about to drive, not in a log, a PR body, or a commit.
+export async function postDeviceAppSession(
+  authBaseUrl: string,
+  sid: string,
+  args: { appId: string; returnTo: string },
+  origin: string = REFRESH_ORIGIN,
+): Promise<BrowserSessionOutcome> {
+  const url = `${authBaseUrl}/device/app-session`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin },
+      body: new URLSearchParams({ sid, app_id: args.appId, return_to: args.returnTo }),
+      signal: AbortSignal.timeout(AUTH_TIMEOUT_MS),
+    });
+  } catch (cause) {
+    throw networkError(`reaching ${authBaseUrl}`, cause);
+  }
+  const json = (await response.json().catch(() => ({}))) as BrowserSessionWire;
+  if (response.ok) {
+    if (!json.url) {
+      throw new BrassApiError(response.status, 'Brass returned no browser-session URL.');
+    }
+    return {
+      state: 'ready',
+      url: json.url,
+      expiresIn: tokenTtlSeconds(json.expires_in),
+    };
+  }
+  if (json.error === 'app_not_approved' && json.approval_url) {
+    return {
+      state: 'needs_approval',
+      approvalUrl: json.approval_url,
+      expiresIn: tokenTtlSeconds(json.expires_in),
+    };
+  }
+  // The server's own wording where it has one: every refusal here names a
+  // specific thing the caller can fix (an unknown app, a return_to off the
+  // allowlist, a sign-in that has ended), and rewording them locally would
+  // lose which.
+  throw new BrassApiError(
+    response.status,
+    json.error_description ??
+      (response.status === 401
+        ? "Your Brass sign-in is no longer valid (401). Run 'brass login' to sign in again."
+        : `Could not mint a browser session (${response.status}).`),
+  );
+}
+
 // Abandon a sign-in this machine started and never redeemed, so the code it
 // relayed to a human stops being redeemable. Reports whether the server took
 // it, like `postSignOut`: the record naming the grant is the caller's only
@@ -216,11 +288,17 @@ interface DeviceAuthorizeWire {
   expires_in: number;
 }
 
+// `targetAppId` is the app the machine will hand a browser once it is signed
+// in (`brass login --app`). The grant still mints for the CLI alone; naming a
+// target only widens what the human's one approval covers, so a later
+// `brass browser-session` needs no second trip to a browser.
 export async function deviceAuthorize(
   authBaseUrl: string,
   now: number = Date.now(),
+  targetAppId?: string,
 ): Promise<DeviceAuthorization> {
   const body = new URLSearchParams({ app_id: CLI_APP_ID });
+  if (targetAppId !== undefined) body.set('target_app_id', targetAppId);
   let response: Response;
   try {
     response = await fetch(`${authBaseUrl}/device/authorize`, {
@@ -232,8 +310,18 @@ export async function deviceAuthorize(
   } catch (cause) {
     throw new Error(`Network error reaching ${authBaseUrl}: ${String(cause)}`);
   }
-  if (!response.ok) throw new Error(`Device sign-in could not start (${response.status})`);
-  const json = (await response.json()) as DeviceAuthorizeWire;
+  // The server's own reason where it sent one. Every 400 here names a
+  // specific thing the caller got wrong (an app id that is not an app, an app
+  // that does not support device sign-in), and a status on its own sends them
+  // looking at the network instead.
+  const json = (await response.json().catch(() => ({}))) as DeviceAuthorizeWire & {
+    error_description?: string;
+  };
+  if (!response.ok) {
+    throw new Error(
+      json.error_description ?? `Device sign-in could not start (${response.status})`,
+    );
+  }
   return {
     deviceCode: json.device_code,
     userCode: json.user_code,
@@ -334,6 +422,8 @@ export async function pollDeviceToken(
 
 export interface DeviceLoginOptions {
   authBaseUrl: string;
+  // An app to approve alongside the CLI (`brass login --app`).
+  targetAppId?: string;
   // Shows the verification URL + user code to the human; defaults to stderr.
   onPrompt?: (auth: DeviceAuthorization) => void;
   // Opens the approval page (user code prefilled) in a browser; defaults to
@@ -344,7 +434,7 @@ export interface DeviceLoginOptions {
 }
 
 export async function loginDevice(options: DeviceLoginOptions): Promise<LoginResult> {
-  const auth = await deviceAuthorize(options.authBaseUrl);
+  const auth = await deviceAuthorize(options.authBaseUrl, Date.now(), options.targetAppId);
   (options.onPrompt ?? defaultDevicePrompt)(auth);
   (options.openBrowser ?? openBrowser)(auth.verificationUriComplete ?? auth.verificationUri);
   const tokens = await pollDeviceToken(
@@ -357,12 +447,14 @@ export async function loginDevice(options: DeviceLoginOptions): Promise<LoginRes
 }
 
 function defaultDevicePrompt(auth: DeviceAuthorization): void {
-  const target = auth.verificationUriComplete ?? auth.verificationUri;
   process.stderr.write(
-    '\nOpening your browser to approve this sign-in.\n' +
-      `If it doesn't open, go to:\n  ${target}\n` +
-      `and confirm the code:  ${auth.userCode}\n` +
-      '\nWaiting for approval...\n',
+    `\n${renderApprovalPrompt({
+      url: auth.verificationUriComplete ?? auth.verificationUri,
+      code: auth.userCode,
+      // This command polls to approval on its own, so there is nothing further
+      // to run; what the reader needs is that the wait has started.
+      closing: 'Waiting for approval...',
+    })}\n`,
   );
 }
 

@@ -79,6 +79,62 @@ export interface DocumentTypeSummary {
   schema_type?: string;
 }
 
+// The join's snapshot and tail-op shapes (`GET /documents/:docId
+// ?include=snapshot`). Anything the response cannot carry inline arrives as a
+// short-lived presigned URL, which is what lets one response deliver a
+// document of any size; the join refuses outright rather than serving a
+// partial one, so a payload that arrives is complete.
+export type DocumentJoinSnapshot =
+  | { kind: 'inline'; data_b64: string }
+  | { kind: 'presigned'; url: string; expires_at: string; raw_bytes: number };
+
+export type DocumentJoinTailOp =
+  | { seq: number; op_blob_b64: string }
+  | { seq: number; op_blob_url: string; op_blob_bytes: number };
+
+// Slow asynchronous work on a document (an import that replaces its content,
+// a push that writes it out). `message` is written to be read verbatim, and
+// the platform owns every word: nothing here branches on a phase or maps a
+// code to copy.
+//
+// `blocking` is the half that matters to a reader. Work that REPLACES the
+// content holds the document read-only, so the join answers with an empty
+// snapshot until it finishes; a push leaves the content readable. `pending`
+// is what separates work still running from work that has stopped, and the
+// two together are what a wait watches: `pending` false with `blocking` still
+// true is work that ended without producing content, which no amount of
+// waiting changes.
+export interface DocumentWorkStatus {
+  message: string;
+  pending: boolean;
+  blocking: boolean;
+  // 0..1, present only on a step the platform can honestly measure.
+  progress?: number;
+}
+
+export interface DocumentJoin {
+  doc_id: string;
+  branch_id: string;
+  stream_branch_id?: string;
+  name?: string;
+  schema_type?: string;
+  snapshot: DocumentJoinSnapshot | null;
+  tail_ops: DocumentJoinTailOp[];
+  snapshot_seq: number;
+  current_seq: number;
+  // Slow asynchronous work on the document, absent in the steady state.
+  status?: DocumentWorkStatus;
+}
+
+// The slice of `GET /documents/{docId}` (without `?include=snapshot`) a
+// blocked read polls. That route resolves no snapshot and presigns no tail,
+// and it records no recent-open, so waiting on it costs a fraction of a join
+// and leaves no trace in the caller's own "jump back in" surfaces.
+export interface DocumentDetail {
+  doc_id: string;
+  status?: DocumentWorkStatus;
+}
+
 // An organization's agentic-coding instructions (its AGENTS.md / CLAUDE.md
 // body), from `GET /organizations/:id/agent-instructions`. `content` is empty
 // when the org has never set them.
@@ -123,6 +179,27 @@ const REQUEST_TIMEOUT_MS = 30_000;
 // a request that carries a few hundred bytes.
 const UPLOAD_TIMEOUT_MS = 300_000;
 
+/**
+ * Fetch bytes from a presigned URL. Not an API call: the signature is the
+ * credential, so no auth header goes with it, and sending one is refused as
+ * a second credential on the request.
+ */
+export async function getPresigned(url: string): Promise<Uint8Array> {
+  let response: Response;
+  try {
+    response = await fetch(url, { signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS) });
+  } catch (cause) {
+    throw networkError('fetching document bytes', cause);
+  }
+  if (!response.ok) {
+    throw new BrassApiError(
+      response.status,
+      `Could not fetch the document's bytes (${response.status}).`,
+    );
+  }
+  return new Uint8Array(await response.arrayBuffer());
+}
+
 /** A failed fetch as the caller should read it, naming a timeout as one. */
 export function networkError(what: string, cause: unknown): BrassApiError {
   const timedOut =
@@ -158,8 +235,9 @@ export class BrassApi {
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const headers: Record<string, string> = {
       ...(await this.auth.headers()),
-      // Version telemetry; the platform logs it so pinned CI copies
-      // stay visible in the deployed-version distribution.
+      // Names this CLI and its version. Brass answers a build too old to
+      // serve with an upgrade message, rather than a failure that names
+      // something else.
       'x-brass-client': CLI_CLIENT_ID,
     };
     let init: RequestInit = { method, headers };

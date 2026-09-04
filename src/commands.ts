@@ -13,8 +13,14 @@ import {
   type HostingVersion,
   type HostingVersionStatus,
   type RefreshCapabilitiesResponse,
+  type DocumentDetail,
+  type DocumentJoin,
+  type DocumentJoinSnapshot,
+  type DocumentJoinTailOp,
+  type DocumentWorkStatus,
   type DocumentStreams,
   type DocumentTypeSummary,
+  getPresigned,
   type AgentInstructionsResponse,
   type OrganizationSummary,
   putPresigned,
@@ -22,7 +28,9 @@ import {
 import type { Logger } from './log.js';
 import type { Profile, ResolvedCredential } from './config.js';
 import {
+  loadFirstManifest,
   mergeSchemaIntoManifest,
+  publishManifestCandidates,
   readManifest,
   writeManifest,
   writeProjectAppId,
@@ -34,6 +42,9 @@ import {
   type AppManifest,
 } from './project.js';
 import { basename } from 'node:path';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { sdkMismatchMessage, type LoadedSdk } from './sdk-pairing.js';
 
 export interface CommandContext {
   api: BrassApi;
@@ -74,8 +85,11 @@ export interface PublishOptions {
   requireAccess?: boolean;
   // Preferred hosting subdomain on first enable.
   slug?: string;
-  // Path to the served manifest, read for a create `name` / `client_token`.
-  manifestPath: string;
+  // An explicit `--manifest` path, read for a create `name` / `client_token`.
+  // Absent searches the bundle's `/.well-known/` copy and then the repo root,
+  // so an app that placed its manifest where the capability docs say is found
+  // without naming it.
+  manifestPath?: string;
   // Polling knobs (defaulted); overridable so tests don't wait on wall clock.
   pollAttempts?: number;
   pollIntervalMs?: number;
@@ -126,7 +140,7 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   // of a couple of reads instead of an upload and a poll loop.
   const unchanged = await activeVersionMatches(ctx, appId, hash);
   if (unchanged !== null) {
-    const status = await awaitGateSettled(
+    const status = await awaitSlotReady(
       ctx,
       appId,
       await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`),
@@ -164,17 +178,24 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
     throw new Error(`Deploy failed: ${version.failure_reason ?? 'unknown reason'}`);
   }
 
+  // The status read comes first because the refresh below reads the manifest
+  // the app SERVES, and the app names the version it serves a moment after the
+  // deploy reports ready. A refresh fired on the ready alone reads the previous
+  // version's manifest, or, on a first publish, none at all and a failed read
+  // over a deploy that worked.
+  const status = await awaitSlotReady(
+    ctx,
+    appId,
+    await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`),
+    opts.sleep ?? realSleep,
+    version.version_id,
+  );
+
   // Best-effort: the platform crawls the served manifest after a deploy on
   // its own, but an explicit refresh surfaces capability warnings (e.g. a
   // schema missing `family`) right here instead of silently later.
   const warnings = await refreshCapabilities(ctx, appId);
 
-  const status = await awaitGateSettled(
-    ctx,
-    appId,
-    await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`),
-    opts.sleep ?? realSleep,
-  );
   if (status.url) ctx.log.success(`Deployed: ${status.url}`);
   return { app_id: appId, version_id: version.version_id, url: status.url, warnings };
 }
@@ -184,17 +205,28 @@ async function resolveOrCreateApp(
   opts: PublishOptions,
 ): Promise<{ appId: string; detail?: AppDetail }> {
   if (opts.appId !== undefined) return { appId: opts.appId };
-  const manifest = await readManifest(opts.manifestPath);
-  const name = opts.name ?? manifest?.name;
+  // An explicit `--manifest` names one file and nothing else, so a typo in it
+  // is reported rather than silently answered by a manifest somewhere else.
+  const searched =
+    opts.manifestPath !== undefined ? [opts.manifestPath] : publishManifestCandidates(opts.dir);
+  const found = await loadFirstManifest(ctx.cwd, searched);
+  const name = opts.name ?? found?.manifest.name;
   if (name === undefined || name.trim() === '') {
+    // A manifest that is absent and one that sets no `name` need different
+    // fixes, so a manifest that was read is named rather than reported as one
+    // of the paths the search missed.
+    const fix =
+      'Pass --name to create one, or --app / BRASS_APP_ID / a .brass/project.json for an existing app.';
     throw new Error(
-      'No app to publish to. Pass --name to create one, or --app / BRASS_APP_ID / a .brass/project.json for an existing app.',
+      found === null
+        ? `No app to publish to, and no manifest to name one from (looked at ${searched.join(' and ')}). ${fix}`
+        : `No app to publish to, and ${found.path} sets no "name". ${fix}`,
     );
   }
   // A `client_token` makes create idempotent, so a repeated create-from-
   // scratch (ephemeral CI has no persisted project.json) resolves the same
   // app rather than minting a duplicate.
-  const clientToken = opts.clientToken ?? manifest?.client_token;
+  const clientToken = opts.clientToken ?? found?.manifest.client_token;
   const organizationId = await resolveCreateOrganizationId(ctx, opts.organizationId);
   const body: { name: string; organization_id?: string; client_token?: string } = {
     name: name.trim(),
@@ -202,6 +234,20 @@ async function resolveOrCreateApp(
   if (organizationId !== undefined) body.organization_id = organizationId;
   if (typeof clientToken === 'string' && clientToken.trim() !== '') {
     body.client_token = clientToken.trim();
+  }
+  // A create is the one call that can duplicate an app, and it duplicates
+  // silently: the run succeeds, and the second app only shows up later as a
+  // pile of them. Say so here, naming where the key belongs, because a caller
+  // who reached this line by passing --name never saw the manifest search.
+  if (body.client_token === undefined) {
+    ctx.log.warn(
+      (found === null
+        ? `No manifest found at ${searched.join(' or ')}.`
+        : `${found.path} sets no "client_token".`) +
+        ' Creating this app without one, so a run that starts with no' +
+        ' .brass/project.json creates a second app instead of resolving this' +
+        ' one. Set "client_token" in the manifest, or pass --client-token.',
+    );
   }
   const app = await ctx.api.post<AppDetail>('/apps', body);
   await writeProjectAppId(ctx.cwd, ctx.profile, app.app_id);
@@ -289,30 +335,42 @@ async function ensureHosting(
 // ready yet is re-read a few times before publish gives up. Publishing
 // reports success only once the slot will actually serve, so an unreachable
 // one is a failed publish rather than a URL that answers 404.
-const GATE_SETTLE_ATTEMPTS = 3;
-const GATE_SETTLE_GAP_MS = 2000;
+const SLOT_READY_ATTEMPTS = 3;
+const SLOT_READY_GAP_MS = 2000;
 
-async function awaitGateSettled(
+// Poll the hosting status until it reports what the rest of the publish reads:
+// the slot registered, and, when the caller names a version, the app serving
+// that one. Reading the manifest the app serves needs the second.
+//
+// A slot that never registers is fatal, since it will not serve. A version the
+// status has not named yet is not: the app names it a moment later, so the
+// publish reports what it did rather than failing over the lag.
+async function awaitSlotReady(
   ctx: CommandContext,
   appId: string,
   status: HostingStatus,
   sleep: (ms: number) => Promise<void>,
+  versionId?: string,
 ): Promise<HostingStatus> {
-  // An api that does not report the field tells us nothing to act on.
-  if (status.gate_settled !== false) return status;
-  for (let attempt = 1; attempt < GATE_SETTLE_ATTEMPTS; attempt++) {
-    await sleep(GATE_SETTLE_GAP_MS);
-    const latest = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
-    if (latest.gate_settled !== false) return latest;
+  // An api that omits `gate_settled` tells us nothing to act on.
+  const ready = (s: HostingStatus): boolean =>
+    s.gate_settled !== false && (versionId === undefined || s.active_version === versionId);
+  let latest = status;
+  for (let attempt = 1; attempt < SLOT_READY_ATTEMPTS && !ready(latest); attempt++) {
+    await sleep(SLOT_READY_GAP_MS);
+    latest = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
   }
   // Says what is true of the SLOT, because both publish paths end here: the
   // one that uploaded a new bundle and the one that found the app already
   // serving this exact bundle and skipped the upload. A message naming an
   // upload sends the second caller looking for one that never happened.
-  throw new Error(
-    'The hosted slot never registered, so it will not serve. ' +
-      'Run publish again to retry.',
-  );
+  if (latest.gate_settled === false) {
+    throw new Error(
+      'The hosted slot never registered, so it will not serve. ' +
+        'Run publish again to retry.',
+    );
+  }
+  return latest;
 }
 
 // The currently-served version when it is `ready` and already carries `hash`,
@@ -386,6 +444,336 @@ async function refreshCapabilities(
     ctx.log.warn(warning);
     return [warning];
   }
+}
+
+export interface ContentsOptions {
+  docId: string;
+  // Which stream to read; the API defaults to `default`.
+  stream?: string | undefined;
+  branch?: string | undefined;
+  // Where to write the JSON. `null` prints it to stdout instead.
+  outPath: string | null;
+  // How long to wait for a document whose content is still being prepared,
+  // in milliseconds. `0` reads once and fails if it is not ready.
+  waitMs?: number;
+  // Polling knobs (defaulted); overridable so tests don't wait on wall clock.
+  pollIntervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface ContentsResult {
+  doc_id: string;
+  stream: string;
+  out_path: string | null;
+  roots: string[];
+  bytes: number;
+}
+
+// Read what a document holds and write it out as JSON.
+//
+// The document is fetched the way an app fetches one, as the compact CRDT
+// snapshot plus the tail that follows it, and unpacked here. That is what
+// makes the answer the WHOLE document rather than a slice of it: the machine
+// running this is the one with the memory to hold a large one, which is the
+// same reason a browser can. A reader building against an example file needs
+// the record types the file carries, and no window over a store carries them,
+// since an import arrives grouped by entity type.
+export async function documentContents(
+  ctx: CommandContext,
+  opts: ContentsOptions,
+): Promise<ContentsResult> {
+  // Work that REPLACES the document's content holds it read-only while it
+  // runs, and the join answers such a document with an empty snapshot: a
+  // drive-linked file whose first open enqueues the import is the case that
+  // reaches here, and this join is what enqueues it. Writing that out lands
+  // an empty file and reports success, which is indistinguishable from a
+  // document that really is empty. An outbound push leaves the content
+  // readable and is not this.
+  let join = await joinDocument(ctx, opts);
+  const waitMs = opts.waitMs ?? DEFAULT_CONTENTS_WAIT_MS;
+  // Only work that is still running is worth waiting on. Work that has
+  // already stopped is answered below without spending a poll on it.
+  if (isContentBlocked(join.status) && join.status.pending && waitMs > 0) {
+    await awaitContentReady(ctx, opts, join.status, waitMs);
+    // One more join, because the poll reads the light route: the content the
+    // wait was for arrives only on a route that carries it.
+    join = await joinDocument(ctx, opts);
+  }
+  // A status that has stopped while still blocking is work that ended without
+  // content, which is terminal however long anyone waits. `ready` is the one
+  // non-terminal reading of that pair, and it is a transient flip on the way
+  // to the status clearing, so what tells the two apart is whether the join
+  // came back carrying anything.
+  if (isContentBlocked(join.status) && !carriesContent(join)) {
+    throw contentUnavailable(opts.docId, join.status, waitMs);
+  }
+
+  // Anything the response could not carry inline arrives as a presigned URL,
+  // which is how one response delivers a document of any size.
+  const [snapshot, ops] = await Promise.all([
+    join.snapshot === null ? null : resolveSnapshot(join.snapshot),
+    // Seq order, because a tail is replayed in it.
+    mapWithConcurrency(
+      [...join.tail_ops].sort((a, b) => a.seq - b.seq),
+      TAIL_FETCH_CONCURRENCY,
+      resolveTailOp,
+    ),
+  ]);
+
+  // Loaded here rather than imported at the top: it pulls the CRDT engine's
+  // WASM, which no other command needs and every other command would
+  // otherwise pay for at startup.
+  assertSdkPairing();
+  const { readDocumentContents } = await import('@brass-build/client/internal');
+  const contents = readDocumentContents(snapshot, ops);
+  const roots = Object.keys(contents);
+  const body = serializeContents(contents, opts.docId);
+  const bytes = Buffer.byteLength(body, 'utf8');
+
+  if (opts.outPath === null) {
+    ctx.log.write(body);
+  } else {
+    await writeTextFile(opts.outPath, body);
+    ctx.log.success(
+      `Wrote ${roots.length === 1 ? '1 root' : `${roots.length} roots`} of ${opts.docId} to ${opts.outPath} (${bytes} bytes)`,
+    );
+  }
+  return {
+    doc_id: join.doc_id,
+    stream: opts.stream ?? DEFAULT_STREAM,
+    out_path: opts.outPath,
+    roots,
+    bytes,
+  };
+}
+
+// The stream a join reads when the caller names none. The API owns the
+// default; this is only what the result reports back.
+const DEFAULT_STREAM = 'default';
+
+// How long a read waits on a document whose content is still being prepared.
+//
+// The command's own join is what enqueues that work for a drive-linked file's
+// first open, so refusing and telling the caller to try later hands them a
+// wait they then have to run by hand. `brass publish` already waits on the
+// slow work it starts; this is the same bargain.
+//
+// The budget is the extraction worker's own 900s ceiling: past it the run is
+// dead rather than slow, so waiting longer reports nothing a shorter wait
+// would not.
+const DEFAULT_CONTENTS_WAIT_MS = 900_000;
+const CONTENTS_POLL_INTERVAL_MS = 2_000;
+const POLL_FAILURES_TOLERATED = 5;
+
+// Narrows as well as answers: a blocked status is by definition present, and
+// every caller here goes on to read its wording.
+function isContentBlocked(
+  status: DocumentWorkStatus | undefined,
+): status is DocumentWorkStatus {
+  return status?.blocking === true;
+}
+
+// Whether a join carries document state at all. A never-compacted document
+// lives entirely in its tail, so neither half alone answers this.
+function carriesContent(join: DocumentJoin): boolean {
+  return join.snapshot !== null || join.tail_ops.length > 0;
+}
+
+async function joinDocument(ctx: CommandContext, opts: ContentsOptions): Promise<DocumentJoin> {
+  const query = new URLSearchParams({ include: 'snapshot' });
+  if (opts.stream !== undefined) query.set('stream', opts.stream);
+  if (opts.branch !== undefined) query.set('branch', opts.branch);
+  return ctx.api.get<DocumentJoin>(
+    `/documents/${encodeURIComponent(opts.docId)}?${query.toString()}`,
+  );
+}
+
+// Poll until the document's inbound work stops, or the budget runs out.
+//
+// The poll reads the LIGHT document route rather than re-joining: a join
+// resolves the snapshot, presigns every spilled tail op, and records a
+// recent-open, so polling it would re-do all of that every couple of seconds
+// and stamp the caller's own recency surfaces once per attempt. The light
+// route carries the same status and does none of it.
+//
+// Returning is not a claim that the content arrived, only that the work
+// stopped; the caller re-joins and reads what it actually got.
+async function awaitContentReady(
+  ctx: CommandContext,
+  opts: ContentsOptions,
+  initial: DocumentWorkStatus,
+  waitMs: number,
+): Promise<void> {
+  const sleep = opts.sleep ?? realSleep;
+  const intervalMs = opts.pollIntervalMs ?? CONTENTS_POLL_INTERVAL_MS;
+  const attempts = Math.max(1, Math.ceil(waitMs / intervalMs));
+  // One line per phase, not one per attempt: the platform re-words the status
+  // as the work moves between steps, and that transition is the only thing a
+  // reader learns from a second line. A heartbeat every couple of seconds
+  // would bury it, and a long import would fill a CI log with it.
+  let said = initial.message;
+  ctx.log.info(`${opts.docId}: ${said}`);
+  let consecutiveFailures = 0;
+  for (let i = 0; i < attempts; i++) {
+    await sleep(intervalMs);
+    let detail: DocumentDetail;
+    try {
+      detail = await ctx.api.get<DocumentDetail>(`/documents/${encodeURIComponent(opts.docId)}`);
+      consecutiveFailures = 0;
+    } catch (err) {
+      // A status read is idempotent and the next one is seconds away, so one
+      // that fails is worth another attempt: this wait is minutes long, and
+      // ending it on a single blip costs the caller the whole import even
+      // though the work continues on the server. A run of them is something
+      // else (a credential that expired, a document that was deleted), and
+      // that error is the answer rather than a silent spin, so only
+      // CONSECUTIVE failures count and a success clears them.
+      consecutiveFailures += 1;
+      if (consecutiveFailures > POLL_FAILURES_TOLERATED) throw err;
+      continue;
+    }
+    const status = detail.status;
+    if (!isContentBlocked(status) || !status.pending) return;
+    if (status.message !== said) {
+      said = status.message;
+      ctx.log.info(`${opts.docId}: ${said}`);
+    }
+  }
+}
+
+// Why a document could not be read, in the caller's terms.
+//
+// The three cases differ in what the caller should do next, and saying "run
+// this again once it settles" to all of them is advice that is wrong for two
+// of them: work that has stopped never settles, and a caller who asked not to
+// wait wants to know that waiting is available.
+function contentUnavailable(
+  docId: string,
+  status: DocumentWorkStatus | undefined,
+  waitMs: number,
+): Error {
+  const message = status?.message ?? 'The content is not available.';
+  if (status?.pending !== true) {
+    return new Error(`${docId} could not be prepared: ${message}`);
+  }
+  if (waitMs === 0) {
+    return new Error(
+      `${docId} is not readable yet: ${message} It is still being prepared; ` +
+        `drop --no-wait to wait for it.`,
+    );
+  }
+  return new Error(
+    `${docId} is not readable yet: ${message} It was still being prepared after ` +
+      `${formatDuration(waitMs)}; run this again, or pass --wait <seconds> to wait longer.`,
+  );
+}
+
+// Refuse an SDK that is not the one this CLI names, before reaching for
+// anything in it. `sdk-pairing.ts` carries why the version is what gets
+// compared; this is the half that reads the two numbers off disk.
+function assertSdkPairing(): void {
+  const message = sdkMismatchMessage({
+    pinned: readOwnPin(),
+    loaded: resolveLoadedSdk(),
+  });
+  if (message !== null) throw new Error(message);
+}
+
+// The version this build names, from the CLI's own manifest. `..` from either
+// layout the module runs in (`dist/commands.js` installed, `src/commands.ts`
+// in the repo) is the package root.
+function readOwnPin(): string | undefined {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { dependencies?: Record<string, string> };
+    return manifest.dependencies?.['@brass-build/client'];
+  } catch {
+    return undefined;
+  }
+}
+
+// The copy that would answer an import from here, or null when none is
+// installed to read (an in-repo run maps the specifier to source).
+function resolveLoadedSdk(): LoadedSdk | null {
+  try {
+    const path = createRequire(import.meta.url).resolve(
+      '@brass-build/client/package.json',
+    );
+    const { version } = JSON.parse(readFileSync(path, 'utf8')) as { version: string };
+    return { version, path };
+  } catch {
+    return null;
+  }
+}
+
+function formatDuration(ms: number): string {
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 120) return `${seconds}s`;
+  return `${Math.round(seconds / 60)}m`;
+}
+
+// How many of a tail's presigned ops are fetched at once.
+//
+// A tail can name a large number of ops whose bytes are fetched separately,
+// and that is the ordinary case rather than the rare one: a bulk write puts
+// nearly every op's bytes outside the response. Firing them all together
+// opens a connection per op and draws resets, on a link that is somebody's
+// home connection. Bounded so the fetch finishes instead of failing partway.
+const TAIL_FETCH_CONCURRENCY = 16;
+
+// `Promise.all` with a ceiling on how many run together, preserving input
+// order in the result.
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  run: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = Array.from({ length: items.length });
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    for (let i = next++; i < items.length; i = next++) {
+      results[i] = await run(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+// One JSON string is what a caller reads and pipes, and V8 caps a single
+// string at 512 MiB however much memory the machine has. A document past
+// that throws a `RangeError` naming neither the document nor the limit, so
+// the ceiling is stated here rather than left to surface as a bare
+// `Invalid string length` out of `JSON.stringify`.
+function serializeContents(contents: object, docId: string): string {
+  try {
+    return `${JSON.stringify(contents, null, 2)}\n`;
+  } catch (cause) {
+    if (cause instanceof RangeError) {
+      throw new Error(
+        `${docId} holds more than a single JSON string can carry (512 MiB), ` +
+          `so it cannot be written as one file. Read a smaller stream of it ` +
+          `with --stream <name>.`,
+      );
+    }
+    throw cause;
+  }
+}
+
+function decodeBase64(value: string): Uint8Array {
+  return new Uint8Array(Buffer.from(value, 'base64'));
+}
+
+async function resolveSnapshot(snapshot: DocumentJoinSnapshot): Promise<Uint8Array> {
+  return snapshot.kind === 'inline'
+    ? decodeBase64(snapshot.data_b64)
+    : await getPresigned(snapshot.url);
+}
+
+async function resolveTailOp(op: DocumentJoinTailOp): Promise<Uint8Array> {
+  return 'op_blob_b64' in op
+    ? decodeBase64(op.op_blob_b64)
+    : await getPresigned(op.op_blob_url);
 }
 
 export interface SchemaPullOptions {
@@ -609,6 +997,11 @@ export interface StatusInputs {
   // sign-in that is still relayable from one it has to restart, which is the
   // difference between waiting and asking the human for a second approval.
   pendingLogin: { userCode: string; verificationUrl: string; expiresAt: number } | null;
+  // An app approval `brass browser-session` asked for that no one has granted
+  // yet. Reported for the same reason the pending sign-in is: it is a step
+  // only the human can take, so a caller that does not hear about it has no
+  // way to know why the app it just asked about is refused.
+  pendingApproval: { appId: string; approvalUrl: string; expiresAt: number } | null;
 }
 
 export interface StatusResult {
@@ -630,6 +1023,13 @@ export interface StatusResult {
   pending_login: {
     user_code: string;
     verification_url: string;
+    expires_in_seconds: number;
+  } | null;
+  // The app approval awaiting a human, when one is outstanding for the app
+  // this status resolved, with the seconds it has left.
+  pending_approval: {
+    app_id: string;
+    approval_url: string;
     expires_in_seconds: number;
   } | null;
   app_id: string | null;
@@ -667,12 +1067,13 @@ export async function status(inp: StatusInputs): Promise<StatusResult> {
       ready_to_publish: false,
       next:
         pending !== null
-          ? `a sign-in for ${inp.profile} is waiting for approval: give the user ` +
-            `${pending.verificationUrl} and the code ${pending.userCode}, then run ` +
+          ? `a sign-in for ${inp.profile} is waiting for approval: put ` +
+            `${pending.verificationUrl} and the code ${pending.userCode} in your ` +
+            `reply, where the user will read them, then run ` +
             `'brass login --check --wait'. It polls until they approve and renews ` +
             `the code if it lapses, so there is no need to start a second sign-in.`
           : `no credential for ${inp.profile}. Run 'brass login --start' to begin a ` +
-            `sign-in, give the user the URL and short code it prints, then run ` +
+            `sign-in, put the URL and short code it prints in your reply, then run ` +
             `'brass login --check --wait' until it reports approved (or set ` +
             `BRASS_SERVICE_TOKEN). The session feeds the build steps ` +
             `('brass agents pull' for the organization's instructions, ` +
@@ -862,15 +1263,45 @@ function pendingLoginReport(inp: StatusInputs): StatusResult['pending_login'] {
   };
 }
 
+// Report an outstanding approval only while the link is still good and only
+// against the app this status resolved, so a caller is never sent to relay a
+// URL the page refuses or one that answers a question about another app.
+function pendingApprovalReport(inp: StatusInputs): StatusResult['pending_approval'] {
+  const pending = inp.pendingApproval;
+  if (pending === null || pending.appId !== inp.appId) return null;
+  const remaining = Math.round((pending.expiresAt - Date.now()) / 1000);
+  if (remaining <= 0) return null;
+  return {
+    app_id: pending.appId,
+    approval_url: pending.approvalUrl,
+    expires_in_seconds: remaining,
+  };
+}
+
 function finish(
   inp: StatusInputs,
-  rest: Omit<StatusResult, 'profile' | 'app_id' | 'pending_login'>,
+  rest: Omit<StatusResult, 'profile' | 'app_id' | 'pending_login' | 'pending_approval'>,
 ): StatusResult {
+  const pendingApproval = pendingApprovalReport(inp);
   const result: StatusResult = {
     profile: inp.profile,
     app_id: inp.appId,
     pending_login: pendingLoginReport(inp),
+    pending_approval: pendingApproval,
     ...rest,
+    // An outstanding approval outranks whatever this branch would otherwise
+    // say, on the same terms as the pending sign-in above it: it is the one
+    // step the caller cannot take itself, and everything else the branch could
+    // name is a step it can. Only once the credential is good, since an
+    // approval is moot to a caller that cannot authenticate at all.
+    ...(pendingApproval !== null && rest.authenticated === true
+      ? {
+          next:
+            `${pendingApproval.app_id} is waiting for approval before it can be opened ` +
+            `in a browser: give the user ${pendingApproval.approval_url} and ask them to ` +
+            `approve, then run 'brass browser-session' again. Publishing is unaffected.`,
+        }
+      : {}),
   };
   const cred =
     result.credential === 'none'
@@ -892,6 +1323,13 @@ function finish(
     );
   }
   inp.log.info(`  app:         ${result.app_id ?? 'none (a first publish creates one)'}`);
+  if (result.pending_approval !== null) {
+    const a = result.pending_approval;
+    inp.log.info(
+      `  approval:    awaiting a human at ${a.approval_url} ` +
+        `(${Math.ceil(a.expires_in_seconds / 60)} min left)`,
+    );
+  }
   if (result.hosting !== null) {
     const h = result.hosting;
     const hostingLine = h.url
