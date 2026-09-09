@@ -6,6 +6,17 @@ package follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, minor releases may introduce breaking
 changes.
 
+## 0.4.1
+
+### Fixed
+
+- `brass publish` checks the build output before it changes anything about the
+  app, so a publish from a missing or empty directory leaves the app as it
+  was.
+- Commands name the CLI as the app making the call, not only the person signed
+  in. `brass login` reports a sign-in the server has stopped accepting, rather
+  than waiting out its own deadline on a code that can no longer be approved.
+
 ## 0.4.0
 
 ### Added

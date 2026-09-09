@@ -43,11 +43,18 @@ export interface RefreshedTokens {
   // the CLI's app id, so a copy of it authenticates as the CLI and nothing
   // else.
   sessionToken?: string;
+  // The acting-app assertion minted alongside the access token, naming the
+  // CLI as the app asking. The access token names the person and never the
+  // app, so this is what the platform reads to tell a CLI call from any
+  // other caller signed in as the same person. Absent against a platform
+  // build that mints none.
+  appAssertion?: string;
 }
 
 interface RefreshWire {
   access_token: string;
   id_token: string;
+  app_assertion?: string;
   expires_in: number;
   session_token?: string;
 }
@@ -120,6 +127,7 @@ export async function postRefresh(
     idToken: json.id_token,
     expiresAt: now + tokenTtlSeconds(json.expires_in) * 1000,
     ...(json.session_token ? { sessionToken: json.session_token } : {}),
+    ...(json.app_assertion ? { appAssertion: json.app_assertion } : {}),
   };
 }
 
@@ -348,7 +356,12 @@ export type DevicePollOutcome =
   | { state: 'approved'; tokens: RefreshedTokens }
   | { state: 'pending' }
   | { state: 'slow_down' }
-  | { state: 'denied' };
+  | { state: 'denied' }
+  // The grant is spent, cancelled, unknown, or its session has ended. The
+  // server returns this to stop the polling, so a caller that reads it as
+  // "keep waiting" relays a code the approval page refuses for the rest of
+  // its own deadline.
+  | { state: 'expired' };
 
 export async function pollDeviceTokenOnce(
   authBaseUrl: string,
@@ -382,11 +395,17 @@ export async function pollDeviceTokenOnce(
         idToken: json.id_token,
         expiresAt: now + tokenTtlSeconds(json.expires_in) * 1000,
         ...(json.session_token ? { sessionToken: json.session_token } : {}),
+        ...(json.app_assertion ? { appAssertion: json.app_assertion } : {}),
       },
     };
   }
-  // The user declined: the one terminal refusal.
+  // The user declined: the one terminal refusal the person chose.
   if (json.error === 'access_denied') return { state: 'denied' };
+  // The other terminal one, which the server chose: the grant was consumed,
+  // cancelled, is unknown, or its session has ended. No later poll of this
+  // grant can be approved, so waiting out the deadline only relays a code the
+  // approval page will not take.
+  if (json.error === 'expired_token') return { state: 'expired' };
   // RFC 8628 §3.5: polling too fast. The caller backs off.
   if (json.error === 'slow_down') return { state: 'slow_down' };
   // Everything else is "keep waiting": `authorization_pending`, a transient
@@ -416,6 +435,9 @@ export async function pollDeviceToken(
     const outcome = await pollDeviceTokenOnce(authBaseUrl, auth.deviceCode, now());
     if (outcome.state === 'approved') return outcome.tokens;
     if (outcome.state === 'denied') throw new Error('Sign-in was denied.');
+    if (outcome.state === 'expired') {
+      throw new Error('Device sign-in expired. Run `brass login` again.');
+    }
     if (outcome.state === 'slow_down') intervalSeconds += 5;
   }
 }
@@ -490,7 +512,17 @@ export function sessionAuth(authBaseUrl: string, sid: string): AuthProvider {
       if (cached === null || Date.now() >= cached.expiresAt - SKEW_MS) {
         cached = await postRefresh(authBaseUrl, sid);
       }
-      return { authorization: `Bearer ${cached.accessToken}`, 'x-id-token': cached.idToken };
+      return {
+        authorization: `Bearer ${cached.accessToken}`,
+        'x-id-token': cached.idToken,
+        // Refreshed on the same call as the token, so the two always name
+        // the same grant. Omitted rather than sent empty when the platform
+        // minted none, since a header the verifier cannot read is the same
+        // as no header and an empty one only obscures which it was.
+        ...(cached.appAssertion
+          ? { 'x-brass-app-assertion': cached.appAssertion }
+          : {}),
+      };
     },
   };
 }

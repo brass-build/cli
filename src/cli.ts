@@ -76,7 +76,7 @@ Usage:
                              --wait [seconds] polls until approved (default 120s), renewing
                              an expired code in place and printing the new one.
   brass logout               End the stored sign-in for this environment, here and on the server.
-  brass browser-session --return-to <url> [--app <appId>]
+  brass browser-session --return-to <url> [--app <appId>] [--json]
                              Print a URL that opens <url> signed in as you, for a browser
                              you drive. The URL is single-use and expires in two minutes.
   brass status [dir] [--app <appId>]
@@ -339,7 +339,12 @@ async function resolveAuth(
   const auth =
     credential.kind === 'service'
       ? serviceTokenAuth(credential.token)
-      : sessionAuth(origins.authBaseUrl, credential.sid);
+      : // The origin the session was minted on, so a command refreshes it
+        // there. The stored profile is keyed on the api host, so an
+        // invocation naming `--api-url` alone lands on a session whose auth
+        // origin the flags do not carry; refreshing against the default one
+        // instead answers 401 and reads as the sign-in having gone stale.
+        sessionAuth(credential.authBaseUrl ?? origins.authBaseUrl, credential.sid);
   return { auth, credentialKind: credential.kind };
 }
 
@@ -547,7 +552,8 @@ async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {
           origins.apiBaseUrl,
           credential.kind === 'service'
             ? serviceTokenAuth(credential.token)
-            : sessionAuth(origins.authBaseUrl, credential.sid),
+            : // The origin the session was minted on, as `resolveAuth` takes.
+              sessionAuth(credential.authBaseUrl ?? origins.authBaseUrl, credential.sid),
         );
 
   // What `publish` would target: the same app-id and manifest-name resolution

@@ -174,6 +174,16 @@ export async function loginCheck(options: LoginCheckOptions): Promise<number> {
       options.log.result({ state: 'denied' });
       return 1;
     }
+    // The server has stopped accepting this grant, so the stored code is one
+    // the approval page refuses. Clearing it is what stops `brass status`
+    // relaying it, and what a caller reads as "start a new one" rather than
+    // "keep waiting".
+    if (outcome.state === 'expired') {
+      await writePendingLogin(options.profile, null, env);
+      options.log.info('That sign-in expired. Run `brass login --start` to begin a new one.');
+      options.log.result({ state: 'expired' });
+      return 1;
+    }
     // RFC 8628 §3.5: polling too fast. Back off for the rest of this wait.
     if (outcome.state === 'slow_down') intervalSeconds += 5;
 

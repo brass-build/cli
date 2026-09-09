@@ -79,7 +79,13 @@ export interface CredentialInputs {
 // refreshes into short-lived access tokens.
 export type ResolvedCredential =
   | { kind: 'service'; token: string; source: 'flag' | 'env' | 'file' }
-  | { kind: 'session'; sid: string; source: 'file' };
+  // `authBaseUrl` is the origin the session was minted on, carried so every
+  // command refreshes it THERE. The profile is keyed on the api host, so an
+  // invocation naming `--api-url` alone lands on a stored session and would
+  // otherwise refresh it against whatever auth origin the flags defaulted to,
+  // which answers 401 and reads as the sign-in having gone stale. Absent on a
+  // file an older CLI wrote, which falls back to the invocation's origin.
+  | { kind: 'session'; sid: string; source: 'file'; authBaseUrl?: string };
 
 // Resolve which credential to use, most-explicit first: an inline `--token`,
 // then `BRASS_SERVICE_TOKEN`, then the stored login session, then a stored
@@ -94,7 +100,14 @@ export function resolveCredential(inputs: CredentialInputs): ResolvedCredential 
   }
   const stored = inputs.file?.credentials[inputs.profile];
   if (stored?.session && isNonEmpty(stored.session.sid)) {
-    return { kind: 'session', sid: stored.session.sid.trim(), source: 'file' };
+    return {
+      kind: 'session',
+      sid: stored.session.sid.trim(),
+      source: 'file',
+      ...(isNonEmpty(stored.session.authBaseUrl)
+        ? { authBaseUrl: stored.session.authBaseUrl.trim() }
+        : {}),
+    };
   }
   if (isNonEmpty(stored?.token)) {
     return { kind: 'service', token: stored.token.trim(), source: 'file' };

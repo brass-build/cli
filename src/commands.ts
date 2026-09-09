@@ -114,9 +114,20 @@ const DEFAULT_POLL_INTERVAL_MS = 2000;
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export async function publish(ctx: CommandContext, opts: PublishOptions): Promise<PublishResult> {
+  // The bundle is read and hashed BEFORE anything about the app is changed.
+  // Every step below writes: it creates the app on a first run, moves the
+  // visibility, claims the slug, and sets the load gate. A build that emitted
+  // nothing, or a directory that is not there, would otherwise leave the app
+  // public and ungated and then refuse the publish, so the flags took effect
+  // and the bundle they were for never shipped.
   if (!(await isDirectory(opts.dir))) {
     throw new Error(`Publish directory not found: ${opts.dir}`);
   }
+  const entries = await collectZipEntries(opts.dir);
+  if (Object.keys(entries).length === 0) {
+    throw new Error(`No files found to publish under ${opts.dir}`);
+  }
+  const hash = contentHash(entries);
 
   const resolved = await resolveOrCreateApp(ctx, opts);
   const appId = resolved.appId;
@@ -127,12 +138,6 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   if (opts.requireAccess !== undefined) {
     await ensureGate(ctx, appId, opts.requireAccess, hosting);
   }
-
-  const entries = await collectZipEntries(opts.dir);
-  if (Object.keys(entries).length === 0) {
-    throw new Error(`No files found to publish under ${opts.dir}`);
-  }
-  const hash = contentHash(entries);
 
   // Skip the upload + unpack-wait when the app already serves this exact
   // bundle. The posture reconcile above still ran, so an unchanged re-publish

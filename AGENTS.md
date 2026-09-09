@@ -154,7 +154,14 @@ and anything you print back to the human.
 redirect allowlist. A new app allows any `localhost` and `127.0.0.1`
 port, so a dev server needs nothing configured. `--app <appId>` names the
 app, and without it the command reads `.brass/project.json`, so after a
-publish in the same directory you can leave it off.
+publish in the same directory you can leave it off. `--json` writes the
+result to stdout as `{ state, url, app_id, return_to, expires_in_seconds }`.
+Read the URL from there in a script, rather than parsing the plain output.
+
+Run `brass login` before this command. The URL opens the app as the person
+this machine is signed in as, so the command fails without one.
+`BRASS_SERVICE_TOKEN` does not work here, because a service token belongs to
+an organization rather than to a person.
 
 Point it at the published URL to drive what you actually shipped:
 
