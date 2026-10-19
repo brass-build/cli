@@ -11,6 +11,9 @@ export interface ParsedArgs {
   // by being present, so any value behind one contradicts the flag itself, and
   // the reading a caller expects is the opposite of the one it would get.
   valuedBooleans: string[];
+  // Value flags given more than once (`--from a --from b`). The parser keeps
+  // the last, so the earlier value would be dropped without a word.
+  repeated: string[];
 }
 
 // Flags that never take a value, so `brass agents pull --stdout ./dir` parses
@@ -40,12 +43,16 @@ const KNOWN_FLAGS = new Set([
   'client-token',
   'dashboard-url',
   'doc',
+  'family',
+  'from',
   'gate',
   'manifest',
+  'max-documents',
   'name',
   'org',
   'out',
   'return-to',
+  'samples-per-type',
   'slug',
   'stream',
   'token',
@@ -96,7 +103,20 @@ const COMMAND_ARGS: Record<string, { flags: readonly string[]; positionals: numb
     positionals: 2,
   },
   contents: {
-    flags: ['branch', 'doc', 'no-wait', 'out', 'stdout', 'stream', 'token', 'wait'],
+    flags: [
+      'branch',
+      'doc',
+      'family',
+      'from',
+      'max-documents',
+      'no-wait',
+      'out',
+      'samples-per-type',
+      'stdout',
+      'stream',
+      'token',
+      'wait',
+    ],
     positionals: 1,
   },
   schema: { flags: ['doc', 'out', 'token'], positionals: 2 },
@@ -160,6 +180,11 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   const positionals: string[] = [];
   const flags: Record<string, string | true> = {};
   const valuedBooleans: string[] = [];
+  const repeated: string[] = [];
+  const setValue = (name: string, value: string | true): void => {
+    if (name in flags && !repeated.includes(name)) repeated.push(name);
+    flags[name] = value;
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === undefined) continue;
@@ -176,7 +201,7 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
           flags[name] = true;
           continue;
         }
-        flags[name] = body.slice(eq + 1);
+        setValue(name, body.slice(eq + 1));
         continue;
       }
       if (BOOLEAN_FLAGS.has(body)) {
@@ -185,16 +210,16 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
       }
       const next = argv[i + 1];
       if (next !== undefined && !next.startsWith('--')) {
-        flags[body] = next;
+        setValue(body, next);
         i++;
       } else {
-        flags[body] = true;
+        setValue(body, true);
       }
     } else {
       positionals.push(arg);
     }
   }
-  return { positionals, flags, valuedBooleans };
+  return { positionals, flags, valuedBooleans, repeated };
 }
 
 // Read a flag expected to carry a string value; a bare boolean flag (no

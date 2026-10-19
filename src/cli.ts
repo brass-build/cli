@@ -45,6 +45,7 @@ import {
   publish,
   schemaPull,
   documentContents,
+  documentSample,
   agentsPull,
   whoami,
   status,
@@ -62,6 +63,7 @@ import {
   type AppManifest,
 } from './project.js';
 
+import { parseRefs, type DocumentSetQuery } from './sample.js';
 import { VERSION } from './version.js';
 
 export { VERSION };
@@ -79,24 +81,45 @@ Usage:
   brass browser-session --return-to <url> [--app <appId>] [--json]
                              Print a URL that opens <url> signed in as you, for a browser
                              you drive. The URL is single-use and expires in two minutes.
-  brass status [dir] [--app <appId>]
+  brass status [dir] [--app <appId>] [--manifest <path>]
                              Report the credential + app state and the one command to run next.
   brass publish [dir]        Build output in [dir] (default: dist) is deployed to the app's hosting.
   brass schema pull --doc <docId> [--out brass-app.json]
                              Fetch a document's schema and write it into a manifest, verbatim.
   brass contents --doc <docId> [--out contents.json | --stdout] [--stream <name>] [--branch <id>]
-                             Write everything a document holds as JSON: every
-                             root container, read whole. The whole document,
-                             not a sample, so every record type it carries is
-                             in the file. A document still being imported is
+                             Write one stream of a document as JSON (the
+                             'default' stream, or --stream <name>): every root
+                             container, read whole. The whole stream, not a
+                             sample, so every record type it carries is in
+                             the file. A document still being imported is
                              waited out (--wait <seconds> moves the deadline,
                              default 900; --no-wait reads once and fails).
+  brass contents --from <ref>[,<ref>] [query flags] [--out sample.json | --stdout]
+                             Sample the documents those references reach.
+                             Each reference is read whole, whatever families
+                             your app filters it to; pass --family to apply
+                             the same filter.
+                             <ref> is organization:<id>, project:<id>, or
+                             document:<id> (a folder reaches everything in it).
+                             Reads up to --max-documents <n> of them (default 20,
+                             spread across families) whole, every stream
+                             or only --stream <name>, and writes,
+                             per stream: the schemas the documents carry, and
+                             for each root, every record type with its record
+                             and document counts and --samples-per-type <n>
+                             records (default 3) drawn from different
+                             documents. --max-documents 0 lists the set
+                             without reading any of it.
+                             --family <f>[,<f>] narrows the set to those families.
+                             A document that cannot be read is reported in
+                             its row; the command fails only when the set
+                             cannot be listed.
   brass agents pull [--out AGENTS.md | --stdout] [--org <organizationId>]
                              Write your organization's agent instructions (its
                              AGENTS.md / CLAUDE.md) to a file, or --stdout to print
                              them (an agent reads them inline). Needs 'brass login';
                              --org is optional when you belong to one organization.
-  brass whoami               Verify the current credential authenticates.
+  brass whoami               Show who is signed in and confirm the credential works.
 
 Authentication:
   Run 'brass login' to sign in with your browser (needed for schema pull),
@@ -106,9 +129,12 @@ Authentication:
 Common flags:
   --token <token>            Service token to authenticate with.
   --json                     Emit the machine-readable result on stdout.
+  --version                  Print the CLI's version.
+  --help                     Print this usage.
 
 Status flags:
   --app <appId>             Report on a specific app (else .brass/project.json / BRASS_APP_ID).
+  --manifest <path>         Manifest to read the app's name from (default: as publish searches).
 
 Sign-in flags:
   --app <appId>             Approve an app you do not own for the sign-in as
@@ -123,11 +149,11 @@ Publish flags:
   --app <appId>             Publish to a specific app (else .brass/project.json / BRASS_APP_ID).
   --name <name>             Name for the app when creating one on first publish.
   --org <organizationId>    Organization to own a newly created app (a signed-in user defaults to their own org; a service token to the token's org).
-  --client-token <key>      Stable key that makes a first create idempotent (else brass-app.json "client_token").
+  --client-token <key>      Stable key that makes a first create idempotent.
   --slug <slug>             Preferred hosting subdomain on first enable.
-  --visibility <v>          Set the app's visibility (private | invitee_visible | public).
+  --visibility <v>          Set the app's visibility (private | public).
   --gate <on|off>           Set the hosted load gate (on = audience-gated, off = world-loadable).
-  --manifest <path>         Served manifest to read a create name from (default: brass-app.json).
+  --manifest <path>         Manifest to read a create name from (default: [dir]/.well-known/brass-app.json, then brass-app.json).
 `;
 
 export async function run(argv: readonly string[]): Promise<number> {
@@ -145,9 +171,15 @@ export async function run(argv: readonly string[]): Promise<number> {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
-  if (command === undefined || boolFlag(parsed, 'help') || command === 'help') {
+  // Asked for, the usage is the result and goes to stdout. A bare `brass` is
+  // a mistake answered with the usage, so it goes to stderr like every other.
+  if (boolFlag(parsed, 'help') || command === 'help') {
     process.stdout.write(USAGE);
-    return command === undefined && !boolFlag(parsed, 'help') ? 1 : 0;
+    return 0;
+  }
+  if (command === undefined) {
+    process.stderr.write(USAGE);
+    return 1;
   }
 
   // Checked after --help / --version so a caller reaching for usage still gets
@@ -181,6 +213,13 @@ export async function run(argv: readonly string[]): Promise<number> {
     );
     return 1;
   }
+  if (parsed.repeated.length > 0) {
+    const names = parsed.repeated.map((n) => `--${n}`).join(', ');
+    process.stderr.write(
+      `error: ${names} ${parsed.repeated.length === 1 ? 'is' : 'are'} given more than once; pass ${parsed.repeated.length === 1 ? 'it' : 'each'} once\n`,
+    );
+    return 1;
+  }
   if (parsed.valuedBooleans.length > 0) {
     const names = parsed.valuedBooleans.map((n) => `--${n}`).join(', ');
     process.stderr.write(
@@ -191,7 +230,7 @@ export async function run(argv: readonly string[]): Promise<number> {
   const bare = valuelessFlags(parsed, valueFlagsOf(command));
   if (bare.length > 0) {
     process.stderr.write(
-      `error: Missing value for ${bare.map((n) => `--${n}`).join(', ')}\n`,
+      `error: missing value for ${bare.map((n) => `--${n}`).join(', ')}\n`,
     );
     return 1;
   }
@@ -287,7 +326,7 @@ const ORIGIN_FLAGS = ['api-url', 'auth-url', 'dashboard-url'] as const;
 function resolveBase(parsed: ParsedArgs): Base {
   const valueless = valuelessFlags(parsed, ORIGIN_FLAGS);
   if (valueless.length > 0) {
-    throw new Error(`Missing value for ${valueless.map((name) => `--${name}`).join(', ')}`);
+    throw new Error(`missing value for ${valueless.map((name) => `--${name}`).join(', ')}`);
   }
   const overrides: OriginOverrides = {};
   const apiUrl = stringFlag(parsed, 'api-url');
@@ -357,6 +396,17 @@ async function runLogin(parsed: ParsedArgs, log: Logger): Promise<number> {
   const check = boolFlag(parsed, 'check');
   const waitSeconds = parseWaitFlag(parsed, DEFAULT_WAIT_SECONDS);
   if (start && check) throw new Error('Pass one of --start or --check.');
+  // Each of these shapes one form of the sign-in, so passing one to a form
+  // that never reads it would leave the caller believing they set it.
+  const unread = [
+    ...(!start && !check ? ['wait', 'new'] : []),
+    ...(check ? ['new', 'app'] : []),
+  ].filter((name) => parsed.flags[name] !== undefined);
+  if (unread.length > 0) {
+    const names = unread.map((n) => `--${n}`).join(', ');
+    const form = check ? '`brass login --check`' : '`brass login` without --start or --check';
+    throw new Error(`${names} ${unread.length === 1 ? 'does' : 'do'} nothing with ${form}`);
+  }
   // The app this sign-in should also approve, so the human's one click covers
   // the machine and the app it is about to hand a browser.
   const targetAppId = stringFlag(parsed, 'app');
@@ -500,7 +550,7 @@ async function runBrowserSession(
     // Through the same frame the sign-in's approval prints in, and with the
     // same relay note: this is the same request with a different subject, and
     // it reaches the human only if whoever runs this passes it on.
-    log.info(
+    log.prompt(
       `\n${renderApprovalPrompt({
         heading: ` To open ${appId} in a browser, it needs approving for this machine.`,
         url: outcome.approvalUrl,
@@ -599,6 +649,10 @@ async function runStatus(parsed: ParsedArgs, log: Logger): Promise<number> {
     appId,
     manifestName,
     publishDir: dir,
+    originFlags: ORIGIN_FLAGS.flatMap((name) => {
+      const value = stringFlag(parsed, name);
+      return value === undefined ? [] : [`--${name}`, value];
+    }),
     pendingLogin:
       pending === null
         ? null
@@ -653,8 +707,7 @@ function planPublish(parsed: ParsedArgs): CommandPlan {
 const DEFAULT_WAIT_SECONDS = 120;
 const MAX_WAIT_SECONDS = 3600;
 // `brass contents` waits by default, so its `--wait` only moves the budget.
-// The default is the extraction worker's own ceiling: past it the run has
-// stopped rather than slowed.
+// Work still unfinished after the default has stopped rather than slowed.
 const CONTENTS_WAIT_SECONDS = 900;
 
 // `--wait` with no value means "the command's own default deadline", which
@@ -672,14 +725,12 @@ function parseWaitFlag(parsed: ParsedArgs, bareValue: number): number | undefine
   return seconds;
 }
 
-// Validate `--visibility` against the three reserved values, so a typo is a
-// clear CLI error rather than a server 400 mid-publish.
+// Validate `--visibility` before any request, so a typo is a clear CLI error
+// rather than a server 400 mid-publish.
 function parseVisibilityFlag(value: string | undefined): AppVisibility | undefined {
   if (value === undefined) return undefined;
-  if (value !== 'private' && value !== 'invitee_visible' && value !== 'public') {
-    throw new Error(
-      `Invalid --visibility "${value}" (expected private, invitee_visible, or public)`,
-    );
+  if (value !== 'private' && value !== 'public') {
+    throw new Error(`Invalid --visibility "${value}" (expected private or public)`);
   }
   return value;
 }
@@ -695,13 +746,28 @@ function parseGateFlag(value: string | undefined): boolean | undefined {
 
 function planContents(parsed: ParsedArgs): CommandPlan {
   const docId = stringFlag(parsed, 'doc');
-  if (docId === undefined) throw new Error('brass contents requires --doc <docId>');
+  const from = stringFlag(parsed, 'from');
+  // One document read whole, or a set sampled: the two name different
+  // answers, so together neither is the one the caller gets.
+  if (docId !== undefined && from !== undefined) {
+    throw new Error('Pass one of --doc or --from, not both');
+  }
+  if (docId === undefined && from === undefined) {
+    throw new Error('brass contents requires --doc <docId>, or --from <ref> to sample a set');
+  }
   const toStdout = boolFlag(parsed, 'stdout');
   const outPath = stringFlag(parsed, 'out');
   // Both name where the JSON goes, so together neither answer is the one the
   // caller gets.
   if (toStdout && outPath !== undefined) {
     throw new Error('Pass one of --stdout or --out, not both');
+  }
+  // `--stdout` writes the JSON there and `--json` the result object after it,
+  // so together stdout holds two documents and no JSON parser reads it.
+  if (toStdout && boolFlag(parsed, 'json')) {
+    throw new Error(
+      'Pass one of --stdout or --json: both write to stdout, so together neither is parseable.',
+    );
   }
   // A document whose content is still being prepared is waited out rather
   // than refused, because this command's own join is what starts that work.
@@ -712,14 +778,81 @@ function planContents(parsed: ParsedArgs): CommandPlan {
   if (noWait && waitSeconds !== undefined) {
     throw new Error('Pass one of --wait or --no-wait, not both');
   }
+  const waitMs = noWait ? 0 : (waitSeconds ?? CONTENTS_WAIT_SECONDS) * 1000;
+
+  if (from !== undefined) {
+    if (parsed.flags['branch'] !== undefined) {
+      throw new Error('--branch reads one document; pass it with --doc, not --from');
+    }
+    const opts = {
+      query: parseSetQuery(parsed, from),
+      stream: stringFlag(parsed, 'stream'),
+      // 0 lists the set and reads none of it.
+      maxDocuments: parseCountFlag(parsed, 'max-documents', SAMPLE_DOCUMENTS, MAX_SAMPLE_DOCUMENTS, 0),
+      samplesPerType: parseCountFlag(parsed, 'samples-per-type', SAMPLES_PER_TYPE, MAX_SAMPLES_PER_TYPE),
+      outPath: toStdout ? null : (outPath ?? 'sample.json'),
+      waitMs,
+    };
+    return (ctx): Promise<unknown> => documentSample(ctx, opts);
+  }
+
+  const setOnly = SET_FLAGS.filter((name) => parsed.flags[name] !== undefined);
+  if (setOnly.length > 0) {
+    const names = setOnly.map((n) => `--${n}`).join(', ');
+    throw new Error(`${names} ${setOnly.length === 1 ? 'selects' : 'select'} a set; pass --from, not --doc`);
+  }
   const opts = {
-    docId,
+    docId: docId!,
     stream: stringFlag(parsed, 'stream'),
     branch: stringFlag(parsed, 'branch'),
     outPath: toStdout ? null : (outPath ?? 'contents.json'),
-    waitMs: noWait ? 0 : (waitSeconds ?? CONTENTS_WAIT_SECONDS) * 1000,
+    waitMs,
   };
   return (ctx): Promise<unknown> => documentContents(ctx, opts);
+}
+
+// The flags that only mean something for a set.
+const SET_FLAGS = [
+  'family',
+  'max-documents',
+  'samples-per-type',
+] as const;
+
+// How many documents a sample reads, and how many records it keeps per type.
+const SAMPLE_DOCUMENTS = 20;
+const MAX_SAMPLE_DOCUMENTS = 200;
+const SAMPLES_PER_TYPE = 3;
+const MAX_SAMPLES_PER_TYPE = 50;
+
+function csvFlag(parsed: ParsedArgs, name: string): string[] | undefined {
+  const raw = stringFlag(parsed, name);
+  if (raw === undefined) return undefined;
+  const parts = raw.split(',').map((p) => p.trim()).filter((p) => p !== '');
+  return parts.length > 0 ? parts : undefined;
+}
+
+function parseCountFlag(
+  parsed: ParsedArgs,
+  name: string,
+  fallback: number,
+  max: number,
+  min = 1,
+): number {
+  const raw = stringFlag(parsed, name);
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    throw new Error(`Invalid --${name} "${raw}" (expected a whole number, ${min} to ${max})`);
+  }
+  return n;
+}
+
+function parseSetQuery(parsed: ParsedArgs, from: string): DocumentSetQuery {
+  const families = csvFlag(parsed, 'family');
+  return {
+    from: parseRefs([from]),
+    ...(families !== undefined ? { families } : {}),
+  };
 }
 
 function planSchema(parsed: ParsedArgs): CommandPlan {
@@ -755,9 +888,15 @@ function planAgents(parsed: ParsedArgs): CommandPlan {
       'Pass one of --stdout or --json: both write to stdout, so together neither is parseable.',
     );
   }
+  const outPath = stringFlag(parsed, 'out');
+  // Both name where the instructions go, so together neither answer is the
+  // one the caller gets.
+  if (boolFlag(parsed, 'stdout') && outPath !== undefined) {
+    throw new Error('Pass one of --stdout or --out, not both');
+  }
   const org = stringFlag(parsed, 'org');
   const options = {
-    outPath: stringFlag(parsed, 'out') ?? 'AGENTS.md',
+    outPath: outPath ?? 'AGENTS.md',
     ...(boolFlag(parsed, 'stdout') ? { stdout: true } : {}),
     ...(org !== undefined ? { organizationId: org } : {}),
   };

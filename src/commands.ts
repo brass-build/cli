@@ -15,7 +15,6 @@ import {
   type RefreshCapabilitiesResponse,
   type DocumentDetail,
   type DocumentJoin,
-  type DocumentJoinSnapshot,
   type DocumentJoinTailOp,
   type DocumentWorkStatus,
   type DocumentStreams,
@@ -29,6 +28,7 @@ import type { Logger } from './log.js';
 import type { Profile, ResolvedCredential } from './config.js';
 import {
   loadFirstManifest,
+  manifestErrors,
   mergeSchemaIntoManifest,
   publishManifestCandidates,
   readManifest,
@@ -41,10 +41,18 @@ import {
   isDirectory,
   type AppManifest,
 } from './project.js';
-import { basename } from 'node:path';
+import { basename, isAbsolute } from 'node:path';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { sdkMismatchMessage, type LoadedSdk } from './sdk-pairing.js';
+import {
+  SampleTally,
+  documentSetListPath,
+  pickDocuments,
+  type DocumentSetListing,
+  type DocumentSetQuery,
+  type StreamTally,
+} from './sample.js';
 
 export interface CommandContext {
   api: BrassApi;
@@ -128,6 +136,7 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
     throw new Error(`No files found to publish under ${opts.dir}`);
   }
   const hash = contentHash(entries);
+  await assertManifestValid(ctx, opts);
 
   const resolved = await resolveOrCreateApp(ctx, opts);
   const appId = resolved.appId;
@@ -163,11 +172,15 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   const bundle = zipEntries(entries);
 
   ctx.log.info('Uploading...');
+  const mintedAt = Date.now();
   const upload = await ctx.api.post<HostingUploadUrl>(
     `/apps/${encodeURIComponent(appId)}/hosting/upload-url`,
-    { content_hash: hash },
+    { content_hash: hash, byte_size: bundle.byteLength },
   );
-  await putPresigned(upload.upload_url, bundle, 'application/zip');
+  await putPresigned(upload.upload_url, bundle, 'application/zip', {
+    expiresAt: mintedAt + upload.expires_in * 1000,
+    sleep: opts.sleep ?? realSleep,
+  });
 
   const completed = await ctx.api.post<HostingVersion>(
     `/apps/${encodeURIComponent(appId)}/hosting/versions/${encodeURIComponent(upload.version_id)}/complete`,
@@ -205,11 +218,36 @@ export async function publish(ctx: CommandContext, opts: PublishOptions): Promis
   return { app_id: appId, version_id: version.version_id, url: status.url, warnings };
 }
 
+// Refuses a manifest whose shared-schema references cannot resolve, before
+// anything about the app changes.
+async function assertManifestValid(ctx: CommandContext, opts: PublishOptions): Promise<void> {
+  const searched =
+    opts.manifestPath !== undefined ? [opts.manifestPath] : publishManifestCandidates(opts.dir);
+  const found = await loadFirstManifest(ctx.cwd, searched);
+  if (found === null) return;
+  const errors = manifestErrors(found.manifest);
+  if (errors.length > 0) {
+    throw new Error(`${found.path} is not a valid manifest:\n${errors.map((e) => `  ${e}`).join('\n')}`);
+  }
+}
+
 async function resolveOrCreateApp(
   ctx: CommandContext,
   opts: PublishOptions,
 ): Promise<{ appId: string; detail?: AppDetail }> {
-  if (opts.appId !== undefined) return { appId: opts.appId };
+  if (opts.appId !== undefined) {
+    const unused = [
+      ...(opts.name !== undefined ? ['--name'] : []),
+      ...(opts.organizationId !== undefined ? ['--org'] : []),
+      ...(opts.clientToken !== undefined ? ['--client-token'] : []),
+    ];
+    if (unused.length > 0) {
+      ctx.log.warn(
+        `${unused.join(', ')} only ${unused.length === 1 ? 'applies' : 'apply'} when publish creates an app, and ${opts.appId} already exists.`,
+      );
+    }
+    return { appId: opts.appId };
+  }
   // An explicit `--manifest` names one file and nothing else, so a typo in it
   // is reported rather than silently answered by a manifest somewhere else.
   const searched =
@@ -217,15 +255,15 @@ async function resolveOrCreateApp(
   const found = await loadFirstManifest(ctx.cwd, searched);
   const name = opts.name ?? found?.manifest.name;
   if (name === undefined || name.trim() === '') {
-    // A manifest that is absent and one that sets no `name` need different
-    // fixes, so a manifest that was read is named rather than reported as one
-    // of the paths the search missed.
-    const fix =
-      'Pass --name to create one, or --app / BRASS_APP_ID / a .brass/project.json for an existing app.';
+    // An explicit `--manifest` that is not there is most likely a typo, so it
+    // is named rather than answered by the generic fix.
+    const missing =
+      opts.manifestPath !== undefined && found === null
+        ? ` No manifest at ${opts.manifestPath} (looked at ${searched.join(' and ')}).`
+        : '';
     throw new Error(
-      found === null
-        ? `No app to publish to, and no manifest to name one from (looked at ${searched.join(' and ')}). ${fix}`
-        : `No app to publish to, and ${found.path} sets no "name". ${fix}`,
+      'No app to publish to. Pass --name to create one, or --app / BRASS_APP_ID / a .brass/project.json for an existing app.' +
+        missing,
     );
   }
   // A `client_token` makes create idempotent, so a repeated create-from-
@@ -242,16 +280,12 @@ async function resolveOrCreateApp(
   }
   // A create is the one call that can duplicate an app, and it duplicates
   // silently: the run succeeds, and the second app only shows up later as a
-  // pile of them. Say so here, naming where the key belongs, because a caller
-  // who reached this line by passing --name never saw the manifest search.
+  // pile of them.
   if (body.client_token === undefined) {
     ctx.log.warn(
-      (found === null
-        ? `No manifest found at ${searched.join(' or ')}.`
-        : `${found.path} sets no "client_token".`) +
-        ' Creating this app without one, so a run that starts with no' +
+      'Creating this app without --client-token, so a run that starts with no' +
         ' .brass/project.json creates a second app instead of resolving this' +
-        ' one. Set "client_token" in the manifest, or pass --client-token.',
+        ' one. Pass --client-token <key>, or commit .brass/project.json.',
     );
   }
   const app = await ctx.api.post<AppDetail>('/apps', body);
@@ -322,7 +356,14 @@ async function ensureHosting(
   requireAccess?: boolean,
 ): Promise<HostingStatus> {
   const status = await ctx.api.get<HostingStatus>(`/apps/${encodeURIComponent(appId)}/hosting`);
-  if (status.enabled) return status;
+  if (status.enabled) {
+    if (slug !== undefined && slug !== status.slug) {
+      ctx.log.warn(
+        `--slug only applies when hosting is first enabled, and this app is already hosted at ${status.slug ?? 'its current address'}.`,
+      );
+    }
+    return status;
+  }
   const body: { slug?: string; require_access?: boolean } = {};
   if (slug !== undefined) body.slug = slug;
   if (requireAccess !== undefined) body.require_access = requireAccess;
@@ -474,19 +515,46 @@ export interface ContentsResult {
   bytes: number;
 }
 
-// Read what a document holds and write it out as JSON.
-//
-// The document is fetched the way an app fetches one, as the compact CRDT
-// snapshot plus the tail that follows it, and unpacked here. That is what
-// makes the answer the WHOLE document rather than a slice of it: the machine
-// running this is the one with the memory to hold a large one, which is the
-// same reason a browser can. A reader building against an example file needs
-// the record types the file carries, and no window over a store carries them,
-// since an import arrives grouped by entity type.
+// Read the whole document and write it out as JSON. The output carries every
+// record type the document has, which a reader building against an example
+// file needs.
 export async function documentContents(
   ctx: CommandContext,
   opts: ContentsOptions,
 ): Promise<ContentsResult> {
+  const { join, contents } = await readStreamContents(ctx, opts);
+  const roots = Object.keys(contents);
+  if (roots.length === 0) {
+    ctx.log.warn(`Document ${opts.docId} has no records in its ${opts.stream ?? DEFAULT_STREAM} stream.`);
+  }
+  const body = serializeContents(contents, opts.docId);
+  const bytes = Buffer.byteLength(body, 'utf8');
+
+  if (opts.outPath === null) {
+    ctx.log.write(body);
+  } else {
+    await writeTextFile(opts.outPath, body);
+    ctx.log.success(
+      `Wrote ${roots.length === 1 ? '1 root' : `${roots.length} roots`} of ${opts.docId} to ${opts.outPath} (${bytes} bytes)`,
+    );
+  }
+  return {
+    doc_id: join.doc_id,
+    stream: opts.stream ?? DEFAULT_STREAM,
+    out_path: opts.outPath,
+    roots,
+    bytes,
+  };
+}
+
+type StreamReadOptions = Omit<ContentsOptions, 'outPath'>;
+
+// One stream of one document, read whole: the read `brass contents --doc`
+// writes out, and the one a sample repeats per document and stream.
+async function readStreamContents(
+  ctx: CommandContext,
+  opts: StreamReadOptions,
+): Promise<{ join: DocumentJoin; contents: Record<string, unknown> }> {
   // Work that REPLACES the document's content holds it read-only while it
   // runs, and the join answers such a document with an empty snapshot: a
   // drive-linked file whose first open enqueues the import is the case that
@@ -513,10 +581,16 @@ export async function documentContents(
     throw contentUnavailable(opts.docId, join.status, waitMs);
   }
 
+  // Loaded here rather than imported at the top: it pulls the CRDT engine's
+  // WASM, which no other command needs and every other command would
+  // otherwise pay for at startup.
+  assertSdkPairing();
+  const { decodeJoinContent, readJoinContents } = await import('@brass-build/client/internal');
   // Anything the response could not carry inline arrives as a presigned URL,
-  // which is how one response delivers a document of any size.
-  const [snapshot, ops] = await Promise.all([
-    join.snapshot === null ? null : resolveSnapshot(join.snapshot),
+  // which is how one response delivers a document of any size. The snapshot
+  // is read the way an app reads one, in whichever encoding the join names.
+  const [content, ops] = await Promise.all([
+    decodeJoinContent(join.snapshot, getPresigned),
     // Seq order, because a tail is replayed in it.
     mapWithConcurrency(
       [...join.tail_ops].sort((a, b) => a.seq - b.seq),
@@ -524,33 +598,236 @@ export async function documentContents(
       resolveTailOp,
     ),
   ]);
+  return { join, contents: readJoinContents(content, ops) };
+}
 
-  // Loaded here rather than imported at the top: it pulls the CRDT engine's
-  // WASM, which no other command needs and every other command would
-  // otherwise pay for at startup.
-  assertSdkPairing();
-  const { readDocumentContents } = await import('@brass-build/client/internal');
-  const contents = readDocumentContents(snapshot, ops);
-  const roots = Object.keys(contents);
-  const body = serializeContents(contents, opts.docId);
+export interface SampleOptions {
+  query: DocumentSetQuery;
+  // Read only this stream of each document, rather than every stream it holds.
+  stream?: string | undefined;
+  // How many of the listed documents to read.
+  maxDocuments: number;
+  // How many records to keep per record type.
+  samplesPerType: number;
+  // Where to write the JSON. `null` prints it to stdout instead.
+  outPath: string | null;
+  waitMs?: number;
+  pollIntervalMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export interface SampledDocument {
+  doc_id: string;
+  name: string;
+  organization_id: string;
+  project_id: string | null;
+  // The project's name, or null when the document is in no project or the
+  // project is not one this credential can list.
+  project_name: string | null;
+  family?: string;
+  file_type?: string;
+  // The folder or archive the document sits in, and its path inside it.
+  member_of?: { doc_id: string; path: string };
+  updated_at: string;
+  status?: DocumentWorkStatus;
+  // The streams read from this document, once it has been read.
+  streams?: string[];
+  // Why this document was not read, when it was picked and could not be.
+  error?: string;
+  // Set when the document was picked and its file has not been imported yet,
+  // because only an app can import it. Such a row is not a failure.
+  not_imported?: true;
+  // Streams of a read document that could not be read, and why.
+  stream_errors?: Record<string, string>;
+}
+
+/** What `sample.json` contains. */
+export interface Sample {
+  query: DocumentSetQuery;
+  // Documents the listing answered with, and how many of them were read.
+  // Folders and archives are not documents here: their files are listed.
+  matched: number;
+  read: number;
+  documents: SampledDocument[];
+  streams: Record<string, StreamTally>;
+}
+
+/** The command's result: the sample's counts and where it was written. */
+export interface SampleResult {
+  query: DocumentSetQuery;
+  matched: number;
+  read: number;
+  out_path: string | null;
+  bytes: number;
+}
+
+// How many documents a sample reads at once. Each read can hold a whole
+// large document in memory, so this stays small.
+const SAMPLE_READ_CONCURRENCY = 4;
+
+// List the documents a set of references reaches, each read whole without the
+// types an app chose it under, then read a spread of them whole and tally their streams by
+// record type. Each read is the `--doc` read, so a sampled stream is exactly
+// what `brass contents --doc <id> --stream <name>` would have written.
+export async function documentSample(
+  ctx: CommandContext,
+  opts: SampleOptions,
+): Promise<SampleResult> {
+  const { documents: rows } = await ctx.api.get<{ documents: DocumentSetRow[] }>(
+    documentSetListPath(opts.query),
+  );
+  // A folder or an archive is a place in the listing, and its files are
+  // listed as documents of their own.
+  const listing = rows.filter((doc) => doc.container === undefined);
+  const projectNames = await listProjectNames(ctx, listing);
+  const describe = (doc: DocumentSetRow): SampledDocument => ({
+    doc_id: doc.doc_id,
+    name: doc.name,
+    organization_id: doc.organization_id,
+    project_id: doc.project_id,
+    project_name: doc.project_id === null ? null : (projectNames.get(doc.project_id) ?? null),
+    ...(doc.schema_type !== undefined ? { family: doc.schema_type } : {}),
+    ...(doc.file_type !== undefined ? { file_type: doc.file_type } : {}),
+    ...(doc.member_of !== undefined ? { member_of: doc.member_of } : {}),
+    updated_at: doc.updated_at,
+    ...(doc.status !== undefined ? { status: doc.status } : {}),
+  });
+  const documents = listing.map(describe);
+  const byId = new Map(documents.map((d) => [d.doc_id, d]));
+
+  let read = 0;
+  const picked = pickDocuments(listing, opts.maxDocuments);
+  // A listing reads no document, so it needs nothing from the SDK.
+  let streams: Record<string, StreamTally> = {};
+  if (picked.length > 0) {
+    assertSdkPairing();
+    const { decodeRecordValue } = await import('@brass-build/client/internal');
+    const tally = new SampleTally((value) => decodeRecordValue(value)?.tag ?? null, opts.samplesPerType);
+    await mapWithConcurrency(picked, SAMPLE_READ_CONCURRENCY, async (doc) => {
+      const entry = byId.get(doc.doc_id)!;
+      const readStream = (name: string) =>
+        readStreamContents(ctx, {
+          docId: doc.doc_id,
+          stream: name,
+          ...(opts.waitMs !== undefined ? { waitMs: opts.waitMs } : {}),
+          ...(opts.pollIntervalMs !== undefined ? { pollIntervalMs: opts.pollIntervalMs } : {}),
+          ...(opts.sleep !== undefined ? { sleep: opts.sleep } : {}),
+        });
+      try {
+        let held = await getSchema(ctx, doc.doc_id);
+        // Streams read before the import has run are the importer's
+        // prediction, and the import can write fewer. The join is what runs
+        // the import, so read the default stream first and ask again.
+        let readFirst: Record<string, unknown> | undefined;
+        if (held.predicted === true) {
+          readFirst = (await readStream(DEFAULT_STREAM)).contents;
+          held = await getSchema(ctx, doc.doc_id);
+        }
+        const names =
+          opts.stream !== undefined
+            ? held.streams.some((s) => s.name === opts.stream)
+              ? [opts.stream]
+              : []
+            : held.streams.map((s) => s.name);
+        const done: string[] = [];
+        for (const name of names) {
+          try {
+            const contents =
+              name === DEFAULT_STREAM && readFirst !== undefined
+                ? readFirst
+                : (await readStream(name)).contents;
+            tally.add(doc.doc_id, name, held.streams.find((s) => s.name === name)?.schema, contents);
+            done.push(name);
+          } catch (err) {
+            if (refusedAsNotImported(err)) throw err;
+            // A stream that cannot be read is reported beside the ones that
+            // could, rather than losing the document from the sample.
+            const message = err instanceof Error ? err.message : String(err);
+            (entry.stream_errors ??= {})[name] = message;
+            ctx.log.warn(`${doc.doc_id} stream ${name}: ${message}`);
+          }
+        }
+        entry.streams = done;
+        // A document counts as read once one of its streams was. When every
+        // stream it was asked for failed, nothing of it reached the sample.
+        if (done.length > 0) {
+          read += 1;
+        } else if (names.length > 0) {
+          entry.error =
+            names.length === 1
+              ? entry.stream_errors![names[0]!]!
+              : `None of its streams could be read (${names.join(', ')})`;
+        }
+      } catch (err) {
+        if (refusedAsNotImported(err)) {
+          entry.not_imported = true;
+          return;
+        }
+        // One unreadable document is a fact about that document, reported in
+        // its row, rather than a reason to lose the rest of the sample.
+        entry.error = err instanceof Error ? err.message : String(err);
+        ctx.log.warn(`${doc.doc_id}: ${entry.error}`);
+      }
+    });
+    streams = tally.toJSON();
+  }
+
+  const payload: Sample = {
+    query: opts.query,
+    matched: listing.length,
+    read,
+    documents,
+    streams,
+  };
+  const body = `${JSON.stringify(payload, null, 2)}\n`;
   const bytes = Buffer.byteLength(body, 'utf8');
-
   if (opts.outPath === null) {
     ctx.log.write(body);
   } else {
     await writeTextFile(opts.outPath, body);
+    const noun = listing.length === 1 ? 'document' : 'documents';
+    const failed = documents.filter((d) => d.error !== undefined).length;
+    const waiting = documents.filter((d) => d.not_imported === true).length;
     ctx.log.success(
-      `Wrote ${roots.length === 1 ? '1 root' : `${roots.length} roots`} of ${opts.docId} to ${opts.outPath} (${bytes} bytes)`,
+      (opts.maxDocuments === 0
+        ? `Listed ${listing.length} ${noun} to ${opts.outPath}`
+        : `Sampled ${read} of ${listing.length} ${noun} to ${opts.outPath}`) +
+        ` (${bytes} bytes)` +
+        (failed > 0 ? `; ${failed} could not be read` : '') +
+        (waiting > 0 ? `; ${waiting} not imported yet` : ''),
     );
   }
-  return {
-    doc_id: join.doc_id,
-    stream: opts.stream ?? DEFAULT_STREAM,
-    out_path: opts.outPath,
-    roots,
-    bytes,
-  };
+  return { query: opts.query, matched: listing.length, read, out_path: opts.outPath, bytes };
 }
+
+// The names of the projects a listing's documents are filed in, from one
+// read of the caller's projects. The names only label the rows, so a failed
+// read leaves them null rather than failing the sample.
+async function listProjectNames(
+  ctx: CommandContext,
+  listing: readonly DocumentSetRow[],
+): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  if (!listing.some((doc) => doc.project_id !== null)) return names;
+  try {
+    const { projects } = await ctx.api.get<{
+      projects: { project_id: string; name: string }[];
+    }>('/projects');
+    for (const project of projects) names.set(project.project_id, project.name);
+  } catch (err) {
+    ctx.log.warn(
+      `Could not read project names: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return names;
+}
+
+// The join refuses a file only an app can import with this code.
+function refusedAsNotImported(err: unknown): boolean {
+  return err instanceof BrassApiError && err.code === 'not_imported';
+}
+
+type DocumentSetRow = DocumentSetListing & { container?: unknown };
 
 // The stream a join reads when the caller names none. The API owns the
 // default; this is only what the result reports back.
@@ -563,11 +840,14 @@ const DEFAULT_STREAM = 'default';
 // wait they then have to run by hand. `brass publish` already waits on the
 // slow work it starts; this is the same bargain.
 //
-// The budget is the extraction worker's own 900s ceiling: past it the run is
-// dead rather than slow, so waiting longer reports nothing a shorter wait
-// would not.
+// Work still unfinished after 900s has stopped rather than slowed, so waiting
+// longer reports nothing this budget would not.
 const DEFAULT_CONTENTS_WAIT_MS = 900_000;
+// The poll starts at 2s and stretches to 15s, so a quick import is noticed
+// quickly and a long one costs a few dozen status reads rather than hundreds.
 const CONTENTS_POLL_INTERVAL_MS = 2_000;
+const CONTENTS_POLL_MAX_INTERVAL_MS = 15_000;
+const CONTENTS_POLL_GROWTH = 1.5;
 const POLL_FAILURES_TOLERATED = 5;
 
 // Narrows as well as answers: a blocked status is by definition present, and
@@ -584,34 +864,40 @@ function carriesContent(join: DocumentJoin): boolean {
   return join.snapshot !== null || join.tail_ops.length > 0;
 }
 
-async function joinDocument(ctx: CommandContext, opts: ContentsOptions): Promise<DocumentJoin> {
-  const query = new URLSearchParams({ include: 'snapshot' });
+async function joinDocument(ctx: CommandContext, opts: StreamReadOptions): Promise<DocumentJoin> {
+  const { SEALED_ACCEPT } = await import('@brass-build/client/internal');
+  return ctx.api.get<DocumentJoin>(contentsJoinPath(opts, SEALED_ACCEPT));
+}
+
+/** The join `brass contents` makes. It opens the document to read, so
+ *  running the command leaves the document as it was. `accept` is the paired
+ *  client's `SEALED_ACCEPT`. */
+export function contentsJoinPath(
+  opts: Pick<ContentsOptions, 'docId' | 'stream' | 'branch'>,
+  accept: string,
+): string {
+  const query = new URLSearchParams({ include: 'snapshot', intent: 'read', accept });
   if (opts.stream !== undefined) query.set('stream', opts.stream);
   if (opts.branch !== undefined) query.set('branch', opts.branch);
-  return ctx.api.get<DocumentJoin>(
-    `/documents/${encodeURIComponent(opts.docId)}?${query.toString()}`,
-  );
+  return `/documents/${encodeURIComponent(opts.docId)}?${query.toString()}`;
 }
 
 // Poll until the document's inbound work stops, or the budget runs out.
 //
-// The poll reads the LIGHT document route rather than re-joining: a join
-// resolves the snapshot, presigns every spilled tail op, and records a
-// recent-open, so polling it would re-do all of that every couple of seconds
-// and stamp the caller's own recency surfaces once per attempt. The light
-// route carries the same status and does none of it.
+// The poll reads the document's metadata rather than re-joining: a join
+// delivers the whole document, so polling one would download it on every
+// poll. The metadata carries the same status.
 //
 // Returning is not a claim that the content arrived, only that the work
 // stopped; the caller re-joins and reads what it actually got.
 async function awaitContentReady(
   ctx: CommandContext,
-  opts: ContentsOptions,
+  opts: StreamReadOptions,
   initial: DocumentWorkStatus,
   waitMs: number,
 ): Promise<void> {
   const sleep = opts.sleep ?? realSleep;
-  const intervalMs = opts.pollIntervalMs ?? CONTENTS_POLL_INTERVAL_MS;
-  const attempts = Math.max(1, Math.ceil(waitMs / intervalMs));
+  let intervalMs = opts.pollIntervalMs ?? CONTENTS_POLL_INTERVAL_MS;
   // One line per phase, not one per attempt: the platform re-words the status
   // as the work moves between steps, and that transition is the only thing a
   // reader learns from a second line. A heartbeat every couple of seconds
@@ -619,8 +905,12 @@ async function awaitContentReady(
   let said = initial.message;
   ctx.log.info(`${opts.docId}: ${said}`);
   let consecutiveFailures = 0;
-  for (let i = 0; i < attempts; i++) {
-    await sleep(intervalMs);
+  let waited = 0;
+  do {
+    const step = Math.max(0, Math.min(intervalMs, waitMs - waited));
+    await sleep(step);
+    waited += step;
+    intervalMs = Math.min(intervalMs * CONTENTS_POLL_GROWTH, CONTENTS_POLL_MAX_INTERVAL_MS);
     let detail: DocumentDetail;
     try {
       detail = await ctx.api.get<DocumentDetail>(`/documents/${encodeURIComponent(opts.docId)}`);
@@ -643,7 +933,7 @@ async function awaitContentReady(
       said = status.message;
       ctx.log.info(`${opts.docId}: ${said}`);
     }
-  }
+  } while (waited < waitMs);
 }
 
 // Why a document could not be read, in the caller's terms.
@@ -667,9 +957,15 @@ function contentUnavailable(
         `drop --no-wait to wait for it.`,
     );
   }
+  // A longer wait than the default reports nothing the default would not, so
+  // the advice is offered only to a caller who chose a shorter one.
+  const advice =
+    waitMs < DEFAULT_CONTENTS_WAIT_MS
+      ? 'run this again, or pass --wait <seconds> to wait longer.'
+      : 'run this again later.';
   return new Error(
     `${docId} is not readable yet: ${message} It was still being prepared after ` +
-      `${formatDuration(waitMs)}; run this again, or pass --wait <seconds> to wait longer.`,
+      `${formatDuration(waitMs)}; ${advice}`,
   );
 }
 
@@ -769,16 +1065,36 @@ function decodeBase64(value: string): Uint8Array {
   return new Uint8Array(Buffer.from(value, 'base64'));
 }
 
-async function resolveSnapshot(snapshot: DocumentJoinSnapshot): Promise<Uint8Array> {
-  return snapshot.kind === 'inline'
-    ? decodeBase64(snapshot.data_b64)
-    : await getPresigned(snapshot.url);
-}
-
 async function resolveTailOp(op: DocumentJoinTailOp): Promise<Uint8Array> {
   return 'op_blob_b64' in op
     ? decodeBase64(op.op_blob_b64)
     : await getPresigned(op.op_blob_url);
+}
+
+// What `schema pull` and `contents` say about a document nothing has written
+// records under a schema for: a file no importer has read, or a document
+// with no type.
+function noSchemaMessage(docId: string): string {
+  return `Document ${docId} has no schema: no importer or app has written records under one.`;
+}
+
+// A document's streams and their schemas. The route answers a document it
+// finds no schema for with a 404 coded `no_schema`, and a missing document
+// with "Document not found", which passes through. A server answering with
+// no code is told apart by its message.
+async function getSchema(ctx: CommandContext, docId: string): Promise<DocumentStreams> {
+  try {
+    return await ctx.api.get<DocumentStreams>(`/documents/${encodeURIComponent(docId)}/schema`);
+  } catch (err) {
+    if (
+      err instanceof BrassApiError &&
+      err.status === 404 &&
+      (err.code === 'no_schema' || (err.code === undefined && /schema/i.test(err.message)))
+    ) {
+      throw new Error(noSchemaMessage(docId));
+    }
+    throw err;
+  }
 }
 
 export interface SchemaPullOptions {
@@ -796,11 +1112,9 @@ export async function schemaPull(
   ctx: CommandContext,
   opts: SchemaPullOptions,
 ): Promise<SchemaPullResult> {
-  const docPath = `/documents/${encodeURIComponent(opts.docId)}`;
-  const [held, summary] = await Promise.all([
-    ctx.api.get<DocumentStreams>(`${docPath}/schema`),
-    ctx.api.get<DocumentTypeSummary>(docPath),
-  ]);
+  const summary = await ctx.api.get<DocumentTypeSummary>(
+    `/documents/${encodeURIComponent(opts.docId)}`,
+  );
   // An app manifest is a CLAIM the developer is about to author: a family
   // plus a body per stream. The document holds no such thing, only streams,
   // so the manifest is ASSEMBLED here rather than read off the document.
@@ -809,14 +1123,19 @@ export async function schemaPull(
   // holds with no published contract is left out: a manifest entry is a
   // shape the app declares it works with, and there is no shape to declare.
   const family = summary.schema_type ?? '';
-  if (family === '') {
-    throw new Error(
-      `Document ${opts.docId} carries no type, so there is no family to declare. Pull from a document an importer or app produced.`,
-    );
-  }
+  if (family === '') throw new Error(noSchemaMessage(opts.docId));
+  const held = await getSchema(ctx, opts.docId);
   const streams: Record<string, Record<string, unknown>> = {};
   for (const entry of held.streams) {
     if (entry.schema !== undefined) streams[entry.name] = entry.schema;
+  }
+  // A family names no shape on its own, so a manifest with no stream bodies
+  // declares nothing a reader could rely on, and publish refuses it.
+  if (Object.keys(streams).length === 0) {
+    throw new Error(
+      `Document ${opts.docId} has no published schema for any of its streams, so there is nothing to declare. ` +
+        'The app or importer that wrote it publishes none, or you cannot read the one it publishes.',
+    );
   }
   const manifest: AppManifest = (await readManifest(opts.outPath)) ?? {};
   await writeManifest(
@@ -966,6 +1285,11 @@ async function resolveCreateOrganizationId(
 
 export interface WhoamiResult {
   authenticated: true;
+  // Who is signed in, for a `brass login` session. Both are null for a
+  // service token, which is an organization's credential rather than a
+  // person's.
+  email: string | null;
+  organizations: OrganizationSummary[] | null;
 }
 
 // Confirm the resolved credential authenticates, over the `apps:write`-gated
@@ -973,11 +1297,32 @@ export interface WhoamiResult {
 // org-scoped identity that enumerates no membership, so it has no org id to
 // address an org-scoped read with. A 401 (rejected credential) or 403 (a token
 // without the publish capability) surfaces as a thrown BrassApiError the CLI
-// turns into a non-zero exit.
+// turns into a non-zero exit. A session then reports the person it belongs to.
 export async function whoami(ctx: CommandContext): Promise<WhoamiResult> {
   await ctx.api.get<{ ok: true }>('/health');
-  ctx.log.success('Authenticated. This credential can publish.');
-  return { authenticated: true };
+  if (ctx.credentialKind !== 'session') {
+    ctx.log.success('Authenticated with a service token. This credential can publish.');
+    return { authenticated: true, email: null, organizations: null };
+  }
+  const [me, organizations] = await Promise.all([
+    ctx.api.get<{ email?: string }>('/users/me'),
+    listCallerOrganizations(ctx),
+  ]);
+  const email = typeof me.email === 'string' && me.email.trim() !== '' ? me.email : null;
+  ctx.log.success(
+    `Signed in${email !== null ? ` as ${email}` : ''}. This credential can publish.`,
+  );
+  if (organizations.length === 0) {
+    ctx.log.info('You do not belong to any organization.');
+  } else {
+    ctx.log.info('Organizations:');
+    for (const org of organizations) ctx.log.info(`  ${org.name} (${org.organization_id})`);
+  }
+  return {
+    authenticated: true,
+    email,
+    organizations: organizations.map(({ organization_id, name }) => ({ organization_id, name })),
+  };
 }
 
 export type CredentialKind = 'none' | 'service' | 'session';
@@ -997,6 +1342,9 @@ export interface StatusInputs {
   manifestName: string | null;
   // The directory `publish` would upload, for the emitted next-step command.
   publishDir: string;
+  // The origin flags `status` was given, as argv words. Every command the
+  // next step names carries them, so it targets the stack `status` read.
+  originFlags: string[];
   // A device grant `brass login --start` minted that no one has approved yet.
   // Reporting it (and how long it has left) is what lets a caller tell a
   // sign-in that is still relayable from one it has to restart, which is the
@@ -1040,13 +1388,27 @@ export interface StatusResult {
   app_id: string | null;
   hosting: { enabled: boolean; deployed: boolean; url: string | null } | null;
   // Whether the state is such that a `publish` would proceed (a credential
-  // that authenticates, and either a resolvable app or a create name).
+  // that authenticates, and either a resolvable app or a create name; a
+  // signed-in person's create also needs one organization to own the app).
   ready_to_publish: boolean;
   // The single imperative next action, as a command where one applies. This is
   // the field an agent acts on: it names the next step rather than describing
   // how publishing works.
   next: string;
 }
+
+// One command a next step names, runnable as printed from where `status` ran.
+function nextCommand(inp: StatusInputs, args: string): string {
+  return ['brass', args, ...inp.originFlags].join(' ');
+}
+
+// The publish directory as a shell word: a bare relative path gains `./` so it
+// reads as a path, and one the shell would split or expand is quoted.
+function publishDirArg(dir: string): string {
+  const path = isAbsolute(dir) || /^\.\.?([\\/]|$)/.test(dir) ? dir : `./${dir}`;
+  return /^[\w./\\:@%+=,-]+$/.test(path) ? path : `"${path.replace(/["$`]/g, '\\$&')}"`;
+}
+
 
 // Report the publish readiness of the current directory + credential and,
 // crucially, the one command to run next. `whoami` answers "does my token
@@ -1055,7 +1417,10 @@ export interface StatusResult {
 // throws on a missing or rejected credential: those are first-class states it
 // reports and turns into a next step, not errors.
 export async function status(inp: StatusInputs): Promise<StatusResult> {
-  const publishCmd = `brass publish ./${inp.publishDir}`;
+  const brass = (args: string): string => nextCommand(inp, args);
+  const dirArg = publishDirArg(inp.publishDir);
+  const publishCmd = brass(`publish ${dirArg}`);
+  const statusCmd = brass(inp.publishDir === 'dist' ? 'status' : `status ${dirArg}`);
   const kind: CredentialKind = inp.credential === null ? 'none' : inp.credential.kind;
 
   // No credential yet. Only the human can approve, but starting the sign-in,
@@ -1075,14 +1440,14 @@ export async function status(inp: StatusInputs): Promise<StatusResult> {
           ? `a sign-in for ${inp.profile} is waiting for approval: put ` +
             `${pending.verificationUrl} and the code ${pending.userCode} in your ` +
             `reply, where the user will read them, then run ` +
-            `'brass login --check --wait'. It polls until they approve and renews ` +
+            `'${brass('login --check --wait')}'. It polls until they approve and renews ` +
             `the code if it lapses, so there is no need to start a second sign-in.`
-          : `no credential for ${inp.profile}. Run 'brass login --start' to begin a ` +
+          : `no credential for ${inp.profile}. Run '${brass('login --start')}' to begin a ` +
             `sign-in, put the URL and short code it prints in your reply, then run ` +
-            `'brass login --check --wait' until it reports approved (or set ` +
+            `'${brass('login --check --wait')}' until it reports approved (or set ` +
             `BRASS_SERVICE_TOKEN). The session feeds the build steps ` +
-            `('brass agents pull' for the organization's instructions, ` +
-            `'brass schema pull' for your example document's schema) as well as ` +
+            `('${brass('agents pull')}' for the organization's instructions, ` +
+            `'${brass('schema pull')}' for your example document's schema) as well as ` +
             `the eventual '${publishCmd}'.`,
     });
   }
@@ -1102,10 +1467,10 @@ export async function status(inp: StatusInputs): Promise<StatusResult> {
       next:
         probe.state === 'unreachable'
           ? `could not reach the Brass API (${probe.error}). Check connectivity, ` +
-            `then run 'brass status' again.`
+            `then run '${statusCmd}' again.`
           : `the Brass API answered, but the credential could not be verified ` +
             `(${probe.error}). The credential was not rejected and the API is ` +
-            `reachable, so run 'brass status' again.`,
+            `reachable, so run '${statusCmd}' again.`,
     });
   }
   if (probe.state === 'rejected') {
@@ -1118,8 +1483,8 @@ export async function status(inp: StatusInputs): Promise<StatusResult> {
       ready_to_publish: false,
       next:
         kind === 'session'
-          ? `the stored sign-in was rejected. Run 'brass login --start' to begin a ` +
-            `new one, relay the printed URL + code, then 'brass login --check --wait'.`
+          ? `the stored sign-in was rejected. Run '${brass('login --start')}' to begin a ` +
+            `new one, relay the printed URL + code, then '${brass('login --check --wait')}'.`
           : `the service token was rejected. Check BRASS_SERVICE_TOKEN or --token.`,
     });
   }
@@ -1128,13 +1493,50 @@ export async function status(inp: StatusInputs): Promise<StatusResult> {
 
   // Verified. What would `publish` target? A service token's create binds to
   // the token's own org by default, so no `--org` is needed to stand one up.
+  // A signed-in person's create needs exactly one organization to own the app,
+  // or `--org` to name one, so the report reads the same list publish reads.
   if (inp.appId === null) {
+    const organizations = kind === 'session' ? await probeOrganizations(inp.api) : null;
+    if (organizations !== null && organizations.length === 0) {
+      return finish(inp, {
+        signed_in: true,
+        credential: kind,
+        authenticated: true,
+        email,
+        hosting: null,
+        ready_to_publish: false,
+        next:
+          `signed in, but you do not belong to any organization, so a first ` +
+          `publish has nothing to own the app. Create or join one in the ` +
+          `dashboard, then run '${statusCmd}' again.`,
+      });
+    }
+    const createCmd =
+      organizations !== null && organizations.length > 1
+        ? `${publishCmd} --org <organizationId>`
+        : publishCmd;
     const next =
       inp.manifestName !== null
-        ? `signed in. No app yet; run '${publishCmd}' to create ` +
+        ? `signed in. No app yet; run '${createCmd}' to create ` +
           `"${inp.manifestName}" and deploy it.`
-        : `signed in. No app yet; run '${publishCmd} --name "<app name>"' ` +
-          `to create and deploy one (or add a "name" to brass-app.json).`;
+        : `signed in. No app yet; run '${createCmd} --name "<app name>"' ` +
+          `to create and deploy one.`;
+    if (organizations !== null && organizations.length > 1) {
+      const names = organizations
+        .map((o) => `${o.organization_id} (${o.name})`)
+        .join(', ');
+      return finish(inp, {
+        signed_in: true,
+        credential: kind,
+        authenticated: true,
+        email,
+        hosting: null,
+        ready_to_publish: false,
+        next:
+          `${next} You belong to several organizations, so --org names the one ` +
+          `that owns the app. Available: ${names}`,
+      });
+    }
     return finish(inp, {
       signed_in: true,
       credential: kind,
@@ -1221,6 +1623,19 @@ async function probeAuth(api: BrassApi): Promise<AuthProbe> {
   }
 }
 
+// The organizations a first publish would choose an owner from, or null when
+// the list could not be read (publish then reports it for itself).
+async function probeOrganizations(api: BrassApi): Promise<OrganizationSummary[] | null> {
+  try {
+    const { organizations } = await api.get<{ organizations: OrganizationSummary[] }>(
+      '/organizations',
+    );
+    return Array.isArray(organizations) ? organizations : null;
+  } catch {
+    return null;
+  }
+}
+
 // The signed-in email for the friendly "signed in as ..." line, best-effort.
 // `/users/me` carries an identity only for a session; a failure (a service
 // token, or any error) just omits the email.
@@ -1304,7 +1719,8 @@ function finish(
           next:
             `${pendingApproval.app_id} is waiting for approval before it can be opened ` +
             `in a browser: give the user ${pendingApproval.approval_url} and ask them to ` +
-            `approve, then run 'brass browser-session' again. Publishing is unaffected.`,
+            `approve, then run '${nextCommand(inp, 'browser-session')}' again. ` +
+            `Publishing is unaffected.`,
         }
       : {}),
   };

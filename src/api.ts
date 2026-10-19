@@ -86,7 +86,8 @@ export interface DocumentTypeSummary {
 // partial one, so a payload that arrives is complete.
 export type DocumentJoinSnapshot =
   | { kind: 'inline'; data_b64: string }
-  | { kind: 'presigned'; url: string; expires_at: string; raw_bytes: number };
+  | { kind: 'presigned'; url: string; expires_at: string; raw_bytes: number }
+  | { kind: 'sealed'; url: string; expires_at: string; raw_bytes: number };
 
 export type DocumentJoinTailOp =
   | { seq: number; op_blob_b64: string }
@@ -127,9 +128,7 @@ export interface DocumentJoin {
 }
 
 // The slice of `GET /documents/{docId}` (without `?include=snapshot`) a
-// blocked read polls. That route resolves no snapshot and presigns no tail,
-// and it records no recent-open, so waiting on it costs a fraction of a join
-// and leaves no trace in the caller's own "jump back in" surfaces.
+// blocked read polls. It carries the document's status without its content.
 export interface DocumentDetail {
   doc_id: string;
   status?: DocumentWorkStatus;
@@ -163,10 +162,13 @@ export interface RefreshCapabilitiesResponse {
 // `{ error: string }` on the 4xx/5xx ladder).
 export class BrassApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  // The machine-readable `code` the API sent beside `error`, when it sent one.
+  readonly code: string | undefined;
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.name = 'BrassApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -200,14 +202,17 @@ export async function getPresigned(url: string): Promise<Uint8Array> {
   return new Uint8Array(await response.arrayBuffer());
 }
 
+function isTimeout(cause: unknown): boolean {
+  return (
+    cause instanceof Error && (cause.name === 'TimeoutError' || cause.name === 'AbortError')
+  );
+}
+
 /** A failed fetch as the caller should read it, naming a timeout as one. */
 export function networkError(what: string, cause: unknown): BrassApiError {
-  const timedOut =
-    cause instanceof Error &&
-    (cause.name === 'TimeoutError' || cause.name === 'AbortError');
   return new BrassApiError(
     0,
-    timedOut
+    isTimeout(cause)
       ? `Timed out ${what}.`
       : `Network error ${what}: ${String(cause)}`,
   );
@@ -255,49 +260,119 @@ export class BrassApi {
       throw networkError(`reaching ${this.apiBaseUrl}`, cause);
     }
     if (!response.ok) {
-      throw new BrassApiError(response.status, await errorMessage(response));
+      const { message, code } = await errorBody(response);
+      throw new BrassApiError(response.status, message, code);
     }
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
   }
 }
 
+// How many times one upload is attempted, counting the first.
+const UPLOAD_MAX_ATTEMPTS = 4;
+const UPLOAD_RETRY_BASE_MS = 1_000;
+const UPLOAD_RETRY_MAX_MS = 8_000;
+// A retry has to start this long before the URL expires, or it is not sent.
+const UPLOAD_EXPIRY_MARGIN_MS = 10_000;
+
+export interface PutPresignedOptions {
+  /** When the URL stops being accepted, in epoch ms. */
+  expiresAt?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  random?: () => number;
+}
+
+// Storage answers 500 and 503 when it is briefly overloaded and asks for the
+// request again. Every other status is the answer.
+function retryableUploadStatus(status: number): boolean {
+  return status === 500 || status === 503;
+}
+
 // Upload bytes to the presigned storage URL the platform handed back.
 // Deliberately carries NO Brass headers and no bearer: the presigned
 // signature pins an exact header set, so a stray `authorization` header
 // invalidates it and the upload is refused.
+//
+// A 500, a 503 or a failed connection is tried again after a jittered,
+// growing wait, as long as the next attempt starts well before the URL
+// expires. The body is a buffer, so each attempt sends it whole. An attempt
+// that runs out of time is not tried again, since another on the same
+// connection would time out the same way.
 export async function putPresigned(
   url: string,
   bytes: Uint8Array,
   contentType: string,
+  opts: PutPresignedOptions = {},
 ): Promise<void> {
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: 'PUT',
-      headers: { 'content-type': contentType },
-      // fflate allocates a plain ArrayBuffer, so narrowing the generic off
-      // `ArrayBufferLike` is sound and satisfies fetch's `BufferSource`
-      // (which pins `ArrayBufferView<ArrayBuffer>`) across lib configs.
-      body: bytes as Uint8Array<ArrayBuffer>,
-      signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
-    });
-  } catch (cause) {
-    throw networkError('uploading the bundle', cause);
-  }
-  if (!response.ok) {
-    throw new BrassApiError(response.status, `Bundle upload failed (${response.status})`);
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const random = opts.random ?? Math.random;
+  for (let attempt = 1; ; attempt++) {
+    let failure: BrassApiError;
+    try {
+      const response = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': contentType },
+        // fflate allocates a plain ArrayBuffer, so narrowing the generic off
+        // `ArrayBufferLike` is sound and satisfies fetch's `BufferSource`
+        // (which pins `ArrayBufferView<ArrayBuffer>`) across lib configs.
+        body: bytes as Uint8Array<ArrayBuffer>,
+        signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+      });
+      if (response.ok) return;
+      if (!retryableUploadStatus(response.status)) {
+        throw new BrassApiError(response.status, `Bundle upload failed (${response.status})`);
+      }
+      failure = new BrassApiError(response.status, `storage answered ${response.status}`);
+    } catch (cause) {
+      if (cause instanceof BrassApiError) throw cause;
+      if (isTimeout(cause)) {
+        throw new BrassApiError(0, UPLOAD_TIMED_OUT_MESSAGE);
+      }
+      failure = networkError('uploading the bundle', cause);
+    }
+
+    const delay = Math.round(
+      random() * Math.min(UPLOAD_RETRY_MAX_MS, UPLOAD_RETRY_BASE_MS * 2 ** (attempt - 1)),
+    );
+    const outOfAttempts = attempt >= UPLOAD_MAX_ATTEMPTS;
+    const outOfTime =
+      opts.expiresAt !== undefined && now() + delay > opts.expiresAt - UPLOAD_EXPIRY_MARGIN_MS;
+    if (outOfAttempts || outOfTime) {
+      throw new BrassApiError(failure.status, uploadGaveUpMessage(failure, attempt, outOfAttempts));
+    }
+    await sleep(delay);
   }
 }
 
+function uploadGaveUpMessage(failure: BrassApiError, attempts: number, outOfAttempts: boolean): string {
+  const tries = attempts === 1 ? '1 attempt' : `${attempts} attempts`;
+  const what =
+    failure.status === 0
+      ? failure.message.replace(/\.$/, '')
+      : `Bundle upload failed: storage answered ${failure.status}`;
+  const why = outOfAttempts
+    ? `after ${tries}`
+    : `after ${tries}, and the upload URL expires before another could start`;
+  return `${what} ${why}. Storage was busy or unreachable; run the command again.`;
+}
+
+const UPLOAD_TIMED_OUT_MESSAGE =
+  'The bundle upload did not finish in time. ' +
+  'The connection to storage was too slow or stalled. Check the connection and run the command again.';
+
 // Pull the server's `{ error }` message off a failed response, falling back
 // to the bare status when the body is not the expected shape.
-async function errorMessage(response: Response): Promise<string> {
+async function errorBody(response: Response): Promise<{ message: string; code?: string }> {
   try {
-    const body = (await response.json()) as { error?: unknown };
-    if (typeof body.error === 'string' && body.error !== '') return body.error;
+    const body = (await response.json()) as { error?: unknown; code?: unknown };
+    const code = typeof body.code === 'string' && body.code !== '' ? body.code : undefined;
+    if (typeof body.error === 'string' && body.error !== '') {
+      return { message: body.error, ...(code !== undefined ? { code } : {}) };
+    }
   } catch {
     // Non-JSON body (an edge / gateway error); fall through to the status.
   }
-  return `Request failed with status ${response.status}`;
+  return { message: `Request failed with status ${response.status}` };
 }

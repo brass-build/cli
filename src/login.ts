@@ -16,6 +16,7 @@
 
 import { deviceAuthorize, pollDeviceTokenOnce, postDeviceCancel, decodeEmail } from './session.js';
 import {
+  readCredentialsFile,
   readPendingLogin,
   writePendingLogin,
   writeStoredCredential,
@@ -43,7 +44,7 @@ export interface LoginStartOptions {
   targetAppId?: string;
   // Set when a wait follows in the same command (`--start --wait`), whose own
   // terminal result is the one the caller reads. `--json` is one document per
-  // run, so the started state prints to the human stream only.
+  // run, so the started state reaches the caller through the prompt alone.
   resultFollows?: boolean;
   env?: NodeJS.ProcessEnv;
   now?: () => number;
@@ -120,12 +121,23 @@ export async function loginCheck(options: LoginCheckOptions): Promise<number> {
   const waitMs = Math.max(0, (options.waitSeconds ?? 0) * 1000);
   const deadline = now() + waitMs;
 
-  let pending = await readPendingLogin(options.profile, env);
-  if (pending === null) {
+  const stored = await readPendingLogin(options.profile, env);
+  if (stored === null) {
+    // A check that finds no grant may follow one that already collected the
+    // approval (a second check, or the person's own terminal), so a stored
+    // session is the outcome the caller is checking for, and starting another
+    // sign-in would ask the person to approve it twice.
+    const credentials = await readCredentialsFile(env);
+    if (credentials?.credentials[options.profile]?.session !== undefined) {
+      options.log.success('Already signed in.');
+      options.log.result({ state: 'approved' });
+      return 0;
+    }
     options.log.info('No sign-in in progress. Run `brass login --start` first.');
     options.log.result({ state: 'none' });
     return 1;
   }
+  let pending: PendingLogin = stored;
   let intervalSeconds = pending.intervalSeconds;
   // Set once the loop renews a lapsed grant, so the reported state tells the
   // caller a NEW code needs relaying rather than the one it already sent.
@@ -135,22 +147,24 @@ export async function loginCheck(options: LoginCheckOptions): Promise<number> {
   // code once rather than twice.
   let justPrompted = false;
 
+  const renew = async (): Promise<void> => {
+    pending = await mintPendingLogin(
+      pending.authBaseUrl,
+      now(),
+      options.profile,
+      env,
+      pending.targetAppId,
+    );
+    intervalSeconds = pending.intervalSeconds;
+    renewed = true;
+    promptFor(options.log, pending, {
+      lead: 'The previous code expired, so this sign-in has a new one.',
+    });
+    justPrompted = true;
+  };
+
   for (;;) {
-    if (now() >= pending.expiresAt) {
-      pending = await mintPendingLogin(
-        pending.authBaseUrl,
-        now(),
-        options.profile,
-        env,
-        pending.targetAppId,
-      );
-      intervalSeconds = pending.intervalSeconds;
-      renewed = true;
-      promptFor(options.log, pending, {
-        lead: 'The previous code expired, so this sign-in has a new one.',
-      });
-      justPrompted = true;
-    }
+    if (now() >= pending.expiresAt) await renew();
 
     const outcome = await pollDeviceTokenOnce(pending.authBaseUrl, pending.deviceCode, now());
     if (outcome.state === 'approved') {
@@ -179,6 +193,15 @@ export async function loginCheck(options: LoginCheckOptions): Promise<number> {
     // relaying it, and what a caller reads as "start a new one" rather than
     // "keep waiting".
     if (outcome.state === 'expired') {
+      // The server's clock and this one disagree by the request's latency and
+      // any skew, so the server can lapse a grant this machine still counts a
+      // few seconds of life in. A grant refused that close to its own expiry
+      // has lapsed rather than been cancelled or spent, and gets the same
+      // in-place renewal as one this machine saw lapse.
+      if (pending.expiresAt - now() <= MIN_USABLE_REMAINING_MS) {
+        await renew();
+        continue;
+      }
       await writePendingLogin(options.profile, null, env);
       options.log.info('That sign-in expired. Run `brass login --start` to begin a new one.');
       options.log.result({ state: 'expired' });
@@ -240,7 +263,7 @@ function remainingSeconds(pending: PendingLogin, now: number): number {
 }
 
 function promptFor(log: Logger, pending: PendingLogin, opts: { lead: string | null }): void {
-  log.info(
+  log.prompt(
     renderApprovalPrompt({
       url: targetUrl(pending),
       code: pending.userCode,

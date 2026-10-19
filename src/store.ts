@@ -137,7 +137,7 @@ interface PendingApprovalsFile {
   pending: Record<Profile, PendingApproval>;
 }
 
-export function pendingApprovalFilePath(env: NodeJS.ProcessEnv = process.env): string {
+function pendingApprovalFilePath(env: NodeJS.ProcessEnv = process.env): string {
   return join(dirname(credentialsFilePath(env)), 'pending-approval.json');
 }
 

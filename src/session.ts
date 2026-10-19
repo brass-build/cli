@@ -506,21 +506,34 @@ function openBrowser(url: string): void {
 // caching it in memory for the process's lifetime.
 export function sessionAuth(authBaseUrl: string, sid: string): AuthProvider {
   let cached: RefreshedTokens | null = null;
+  // Calls made together share one refresh, so commands that start at once
+  // do not fail their sign-in.
+  let refreshing: Promise<RefreshedTokens> | null = null;
   const SKEW_MS = 60 * 1000;
+  async function current(): Promise<RefreshedTokens> {
+    if (cached !== null && Date.now() < cached.expiresAt - SKEW_MS) return cached;
+    refreshing ??= postRefresh(authBaseUrl, sid)
+      .then((tokens) => {
+        cached = tokens;
+        return tokens;
+      })
+      .finally(() => {
+        refreshing = null;
+      });
+    return refreshing;
+  }
   return {
     async headers() {
-      if (cached === null || Date.now() >= cached.expiresAt - SKEW_MS) {
-        cached = await postRefresh(authBaseUrl, sid);
-      }
+      const tokens = await current();
       return {
-        authorization: `Bearer ${cached.accessToken}`,
-        'x-id-token': cached.idToken,
+        authorization: `Bearer ${tokens.accessToken}`,
+        'x-id-token': tokens.idToken,
         // Refreshed on the same call as the token, so the two always name
         // the same grant. Omitted rather than sent empty when the platform
         // minted none, since a header the verifier cannot read is the same
         // as no header and an empty one only obscures which it was.
-        ...(cached.appAssertion
-          ? { 'x-brass-app-assertion': cached.appAssertion }
+        ...(tokens.appAssertion
+          ? { 'x-brass-app-assertion': tokens.appAssertion }
           : {}),
       };
     },

@@ -6,6 +6,32 @@ package follows [semantic versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below `1.0.0`, minor releases may introduce breaking
 changes.
 
+## 0.5.0
+
+### Added
+
+- `brass contents --from <reference>` samples the documents in a project,
+  folder or file, to show what your app's inputs contain.
+- `brass whoami` names the signed-in user.
+
+### Changed
+
+- `--visibility` accepts `private` or `public`. Replace `invitee_visible` with
+  `private`.
+- `brass publish` checks `brass-app.json` before uploading, including with
+  `--app`, and lists each problem.
+- `brass login --json` prints the sign-in link and code right away, so an
+  agent can pass them on while the command waits.
+- `brass status` tells you when your first publish needs `--org`.
+
+### Fixed
+
+- `brass login --check --wait` expired a sign-in early when your clock ran
+  ahead of the server's.
+- `brass schema pull` and `brass contents` report a document with no schema
+  as having none, not as an error.
+- `brass publish` retries an upload that fails briefly.
+
 ## 0.4.1
 
 ### Fixed

@@ -17,7 +17,7 @@ export interface ProjectState {
 const PROJECT_DIR = '.brass';
 const PROJECT_FILE = 'project.json';
 
-export function projectStatePath(cwd: string): string {
+function projectStatePath(cwd: string): string {
   return join(cwd, PROJECT_DIR, PROJECT_FILE);
 }
 
@@ -68,9 +68,12 @@ function nonEmpty(v: string | undefined): v is string {
 }
 
 // The served capability manifest an app authors (`brass-app.json` /
-// `/.well-known/brass-app.json`). The CLI reads `name` for a first create
-// (and `client_token` as its stable idempotency key), and writes `schema` on
-// a `schema pull`; every other field is passed through untouched.
+// `/.well-known/brass-app.json`). The CLI writes `schema` on a `schema pull`
+// and passes every other field through untouched. A first create also reads
+// `name` and `client_token` from a manifest that carries them, for the apps
+// whose pipelines already depend on that; the docs and the CLI's messages
+// teach `--name` and `--client-token` instead, because the platform reads
+// neither key from the manifest and a renamed `name` renames nothing.
 export interface AppManifest {
   name?: string;
   // A stable, caller-chosen key that makes a first `publish` from CI
@@ -80,7 +83,9 @@ export interface AppManifest {
   // runs. Opaque and non-secret (org-scoped; creating with it still needs the
   // caller's org authority).
   client_token?: string;
-  schema?: BrassSchemaManifest;
+  // Inline, or `{ "$ref": "#/shared_schemas/<name>" }`.
+  schema?: BrassSchemaManifest | { $ref: string };
+  shared_schemas?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -183,15 +188,131 @@ export async function writeTextFile(path: string, content: string): Promise<void
   await writeFile(path, content, 'utf8');
 }
 
-// Set the manifest's `schema` to a pulled schema manifest, preserving every
-// other field and their order. Pure so the "copy verbatim" guarantee is
-// testable: the declaration goes in unchanged, no re-derivation. Returns a
-// new object.
+const SCHEMA_REF_PREFIX = '#/shared_schemas/';
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// The `shared_schemas` name a position refers to, or null for an inline or
+// absent schema.
+function referencedName(value: unknown): string | null {
+  if (!isPlainObject(value) || Object.keys(value).length !== 1) return null;
+  const ref = value['$ref'];
+  return typeof ref === 'string' && ref.startsWith(SCHEMA_REF_PREFIX)
+    ? ref.slice(SCHEMA_REF_PREFIX.length)
+    : null;
+}
+
+function inputEntries(manifest: AppManifest): unknown[] {
+  return Array.isArray(manifest['inputs']) ? manifest['inputs'] : [];
+}
+
+function importEntries(manifest: AppManifest): unknown[] {
+  return Array.isArray(manifest['imports']) ? manifest['imports'] : [];
+}
+
+// Put a pulled schema manifest where the app's `schema` is, preserving every
+// other field and their order. A `schema` that refers to a shared schema
+// updates that shared schema, so the schema the app opens and the inputs
+// that refer to it stay one definition, unless an `imports` entry and no
+// `inputs` entry also uses it: then `schema` is written inline and the
+// import keeps its schema. Any other `schema` is replaced inline.
+// Pure, so the "copy verbatim" guarantee is testable: the declaration goes in
+// unchanged, no re-derivation. Returns a new object.
 export function mergeSchemaIntoManifest(
   manifest: AppManifest,
   schema: BrassSchemaManifest,
 ): AppManifest {
+  const name = referencedName(manifest.schema);
+  const shared = manifest.shared_schemas;
+  const usedByAnImport = importEntries(manifest).some(
+    (entry) => isPlainObject(entry) && referencedName(entry['schema']) === name,
+  );
+  const usedByAnInput = inputEntries(manifest).some((entry) => referencedName(entry) === name);
+  if (
+    name !== null &&
+    isPlainObject(shared) &&
+    Object.prototype.hasOwnProperty.call(shared, name) &&
+    (usedByAnInput || !usedByAnImport)
+  ) {
+    return { ...manifest, shared_schemas: { ...shared, [name]: schema } };
+  }
   return { ...manifest, schema };
+}
+
+// JSON with object keys sorted, so two schemas that differ only in key order
+// compare equal.
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`);
+  return `{${entries.join(',')}}`;
+}
+
+// The reasons a manifest cannot be published: an `inputs` entry that is a
+// bare family word, a shared schema written as a
+// `$ref`, a `$ref` that does not name a `shared_schemas` entry or sits beside
+// other keys, an `imports` entry with a
+// `schema` but no `extension` to apply it to, and two `imports` entries giving
+// one extension different schemas, and an `access` block naming a key or a
+// value Brass does not read. Checked before anything is uploaded, since
+// the platform would otherwise drop or outvote what the manifest says.
+export function manifestErrors(manifest: AppManifest): string[] {
+  const shared = isPlainObject(manifest.shared_schemas) ? manifest.shared_schemas : {};
+  const errors: string[] = [];
+  const checkRef = (where: string, value: unknown): void => {
+    if (!isPlainObject(value) || !('$ref' in value)) return;
+    const ref = value['$ref'];
+    if (typeof ref !== 'string' || !ref.startsWith(SCHEMA_REF_PREFIX)) {
+      errors.push(`${where}: "$ref" must read "${SCHEMA_REF_PREFIX}<name>"`);
+    } else if (Object.keys(value).length > 1) {
+      errors.push(`${where}: give "$ref" alone, or the schema inline, not both`);
+    } else if (!Object.prototype.hasOwnProperty.call(shared, ref.slice(SCHEMA_REF_PREFIX.length))) {
+      errors.push(`${where}: "shared_schemas" defines no "${ref.slice(SCHEMA_REF_PREFIX.length)}"`);
+    }
+  };
+  for (const [name, definition] of Object.entries(shared)) {
+    if (isPlainObject(definition) && '$ref' in definition) {
+      errors.push(`shared_schemas "${name}": write the schema itself here, not a "$ref"`);
+    }
+  }
+  checkRef('schema', manifest.schema);
+  errors.push(...accessErrors(manifest['access']));
+  inputEntries(manifest).forEach((entry, i) => {
+    const where = `inputs entry ${i + 1}`;
+    if (typeof entry === 'string') {
+      errors.push(`${where}: write the schema of the documents you read, not the family "${entry}"`);
+    }
+    checkRef(where, entry);
+  });
+  const firstForExtension = new Map<string, { entry: number; schema: string }>();
+  importEntries(manifest).forEach((entry, i) => {
+    if (!isPlainObject(entry)) return;
+    const where = `imports entry ${i + 1}`;
+    const extension =
+      typeof entry['extension'] === 'string'
+        ? entry['extension'].trim().replace(/^\.+/, '').toLowerCase()
+        : '';
+    if (entry['schema'] !== undefined) {
+      if (extension === '') errors.push(`${where}: a "schema" needs an "extension" to apply to`);
+      checkRef(where, entry['schema']);
+    }
+    if (extension === '') return;
+    const name = referencedName(entry['schema']);
+    const resolved = name !== null ? shared[name] : entry['schema'];
+    const schema = resolved === undefined ? '' : canonicalJson(resolved);
+    const first = firstForExtension.get(extension);
+    if (first === undefined) {
+      firstForExtension.set(extension, { entry: i + 1, schema });
+    } else if (first.schema !== schema) {
+      errors.push(`${where}: entry ${first.entry} also names "${extension}" with a different schema`);
+    }
+  });
+  return errors;
 }
 
 // Recursively collect a directory's files into fflate's zip input map, keyed
@@ -282,4 +403,25 @@ export async function isDirectory(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+const ACCESS_CREATE_VALUES: readonly unknown[] = [false, 'signed-in', 'anyone'];
+const ACCESS_OPEN_VALUES: readonly unknown[] = ['signed-in', 'anyone'];
+
+function accessErrors(access: unknown): string[] {
+  if (access === undefined) return [];
+  if (!isPlainObject(access)) return ['access: write an object with "create" and "open"'];
+  const errors: string[] = [];
+  for (const key of Object.keys(access)) {
+    if (key !== 'create' && key !== 'open') {
+      errors.push(`access: "${key}" is not an access setting; use "create" or "open"`);
+    }
+  }
+  if (access['create'] !== undefined && !ACCESS_CREATE_VALUES.includes(access['create'])) {
+    errors.push('access.create: write false, "signed-in" or "anyone"');
+  }
+  if (access['open'] !== undefined && !ACCESS_OPEN_VALUES.includes(access['open'])) {
+    errors.push('access.open: write "signed-in" or "anyone"');
+  }
+  return errors;
 }

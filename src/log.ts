@@ -5,6 +5,11 @@
 
 export interface Logger {
   info(message: string): void;
+  // An approval a human has to give: the URL and code to relay. Printed under
+  // `--json` too, because the caller reading `--json` is usually the one
+  // relaying it, and a wait that follows in the same command would otherwise
+  // hold the code back until the wait is over.
+  prompt(message: string): void;
   warn(message: string): void;
   success(message: string): void;
   result(payload: unknown): void;
@@ -19,6 +24,9 @@ export function createLogger(json: boolean): Logger {
   return {
     info(message) {
       if (!json) process.stderr.write(`${message}\n`);
+    },
+    prompt(message) {
+      process.stderr.write(`${message}\n`);
     },
     // Warnings survive `--json`, unlike status lines. `--json` reserves
     // STDOUT for the result, which a warning on stderr never touches, and the
